@@ -1,0 +1,31 @@
+# Build outputs
+bin/
+build/
+.vs/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.recipe
+*.idb
+
+# Secrets / local credentials — NEVER commit
+proxydetails.txt
+ssh details for proxypi.txt
+**/ProxyPiTester.ini
+**/ProxyTools.ini
+*.env
+_ssh_test.txt
+
+# Local noise
+*.user
+*.suo
+*.aps
+.DS_Store
