@@ -24,7 +24,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.0.0";
+static const wchar_t* APP_VERSION = L"1.1.0";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -34,6 +34,9 @@ static const wchar_t* GITHUB_API_HOST = L"api.github.com";
 static const wchar_t* GITHUB_API_PATH = L"/repos/conthegreat/proxypitester/releases/latest";
 static const wchar_t* DEFAULT_DOWNLOAD_URL = L"https://github.com/conthegreat/proxypitester/releases/latest";
 static const wchar_t* WEBSITE_URL = L"https://proxypi.co.uk";
+// Production website JSON API (proxies to internal RADIUS API)
+static const wchar_t* DESKTOP_API_HOST = L"proxypi.co.uk";
+static const wchar_t* DESKTOP_LOGIN_PATH = L"/api/desktop/login";
 
 // ---- ProxyPi brand palette (from proxypi.co.uk CSS) ----
 static const COLORREF COL_BG         = RGB(15, 23, 42);     // #0f172a
@@ -64,6 +67,9 @@ static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent gl
 #define ID_BTN_SITE     2011
 #define ID_EDIT_RESULT  2012
 #define ID_STATIC_STATUS 2013
+#define ID_EDIT_ACCT_EMAIL 2014
+#define ID_EDIT_ACCT_PASS  2015
+#define ID_BTN_LOGIN       2016
 
 // Menu IDs
 #define IDM_FILE_EXIT       3001
@@ -75,6 +81,7 @@ static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent gl
 #define WM_APP_TEST_DONE    (WM_APP + 10)
 #define WM_APP_SPEED_DONE   (WM_APP + 11)
 #define WM_APP_UPDATE_DONE  (WM_APP + 12)
+#define WM_APP_LOGIN_DONE   (WM_APP + 13)
 
 static HWND hMain = nullptr;
 static HWND hComboType = nullptr;
@@ -85,6 +92,7 @@ static HWND hBtnTest = nullptr, hBtnSpeed = nullptr;
 static HWND hBtnSave = nullptr, hBtnLoad = nullptr, hBtnSite = nullptr;
 static HWND hResult = nullptr;
 static HWND hStatus = nullptr;
+static HWND hAcctEmail = nullptr, hAcctPass = nullptr, hBtnLogin = nullptr;
 
 static HFONT hFontUi = nullptr;
 static HFONT hFontTitle = nullptr;
@@ -109,7 +117,7 @@ static std::wstring g_lastDetail;
 
 // Layout constants (CLIENT area size — window chrome is added via AdjustWindowRectEx)
 static const int CLIENT_W = 560;
-static const int CLIENT_H = 760;
+static const int CLIENT_H = 900;
 static const int PAD = 24;
 static const int CARD_X = 20;
 static const int CARD_W = CLIENT_W - 40;
@@ -173,6 +181,7 @@ static void SetBusy(bool busy) {
   EnableWindow(hBtnSpeed, !busy);
   EnableWindow(hBtnSave, !busy);
   EnableWindow(hBtnLoad, !busy);
+  if (hBtnLogin) EnableWindow(hBtnLogin, !busy);
 }
 
 static ProxyConfig ReadConfigFromUI() {
@@ -297,6 +306,57 @@ static std::wstring Utf8ToWide(const std::string& s) {
   return w;
 }
 
+// Escape a string for JSON body
+static std::string JsonEscape(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 8);
+  for (unsigned char c : s) {
+    if (c == '"' || c == '\\') { o.push_back('\\'); o.push_back((char)c); }
+    else if (c == '\n') { o += "\\n"; }
+    else if (c == '\r') { o += "\\r"; }
+    else if (c == '\t') { o += "\\t"; }
+    else o.push_back((char)c);
+  }
+  return o;
+}
+
+static std::string WideToUtf8(const std::wstring& w) {
+  if (w.empty()) return {};
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+  std::string s(n, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+  return s;
+}
+
+static bool JsonGetNumber(const std::string& json, const char* key, int& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t p = json.find(pat);
+  if (p == std::string::npos) return false;
+  p = json.find(':', p + pat.size());
+  if (p == std::string::npos) return false;
+  p = json.find_first_of("0123456789-", p + 1);
+  if (p == std::string::npos) return false;
+  out = atoi(json.c_str() + p);
+  return true;
+}
+
+static bool JsonGetBool(const std::string& json, const char* key, bool& out) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t p = json.find(pat);
+  if (p == std::string::npos) return false;
+  p = json.find(':', p + pat.size());
+  if (p == std::string::npos) return false;
+  size_t t = json.find("true", p);
+  size_t f = json.find("false", p);
+  if (t != std::string::npos && (f == std::string::npos || t < f) && t < p + 12) {
+    out = true; return true;
+  }
+  if (f != std::string::npos && f < p + 12) {
+    out = false; return true;
+  }
+  return false;
+}
+
 // HTTPS GET via WinHTTP (for public update feeds)
 static bool HttpGetHttps(const wchar_t* host, const wchar_t* path, std::string& outBody, std::wstring& err,
                          const wchar_t* userAgent = L"ProxyPiTester/1.0") {
@@ -365,6 +425,139 @@ static bool HttpGetHttps(const wchar_t* host, const wchar_t* path, std::string& 
     return false;
   }
   return true;
+}
+
+// HTTPS POST JSON body
+static bool HttpPostHttpsJson(const wchar_t* host, const wchar_t* path, const std::string& jsonBody,
+                              std::string& outBody, int& outStatus, std::wstring& err) {
+  outBody.clear();
+  outStatus = 0;
+  HINTERNET hSession = WinHttpOpen(L"ProxyPiTester/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!hSession) { err = L"WinHttpOpen failed"; return false; }
+  DWORD timeout = 20000;
+  WinHttpSetTimeouts(hSession, timeout, timeout, timeout, timeout);
+
+  HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+  if (!hConnect) {
+    err = L"Cannot reach " + std::wstring(host);
+    WinHttpCloseHandle(hSession);
+    return false;
+  }
+
+  HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path, nullptr,
+                                          WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                          WINHTTP_FLAG_SECURE);
+  if (!hRequest) {
+    err = L"WinHttpOpenRequest failed";
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return false;
+  }
+
+  std::wstring headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+  BOOL ok = WinHttpSendRequest(hRequest, headers.c_str(), (DWORD)-1L,
+                               (LPVOID)jsonBody.data(), (DWORD)jsonBody.size(),
+                               (DWORD)jsonBody.size(), 0);
+  if (!ok || !WinHttpReceiveResponse(hRequest, nullptr)) {
+    err = L"Login request failed (network or HTTPS)";
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return false;
+  }
+
+  DWORD status = 0, statusSize = sizeof(status);
+  WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                      WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+  outStatus = (int)status;
+
+  for (;;) {
+    DWORD avail = 0;
+    if (!WinHttpQueryDataAvailable(hRequest, &avail)) break;
+    if (avail == 0) break;
+    std::vector<char> buf(avail + 1);
+    DWORD read = 0;
+    if (!WinHttpReadData(hRequest, buf.data(), avail, &read) || read == 0) break;
+    outBody.append(buf.data(), read);
+    if (outBody.size() > 256 * 1024) break;
+  }
+
+  WinHttpCloseHandle(hRequest);
+  WinHttpCloseHandle(hConnect);
+  WinHttpCloseHandle(hSession);
+  return true;
+}
+
+struct DesktopLoginResult {
+  bool ok = false;
+  std::wstring message;
+  std::wstring host;
+  int socksPort = 0;
+  int httpPort = 0;
+  std::wstring proxyUser;
+  std::wstring proxyPass;
+  std::wstring email;
+  double usedMb = 0;
+  double limitMb = 0;
+};
+
+static DesktopLoginResult PerformDesktopLogin(const std::wstring& email, const std::wstring& password) {
+  DesktopLoginResult r;
+  std::string bodyJson = std::string("{\"email\":\"") + JsonEscape(WideToUtf8(email)) +
+                         "\",\"password\":\"" + JsonEscape(WideToUtf8(password)) + "\"}";
+  std::string resp;
+  int status = 0;
+  std::wstring err;
+  if (!HttpPostHttpsJson(DESKTOP_API_HOST, DESKTOP_LOGIN_PATH, bodyJson, resp, status, err)) {
+    r.message = err;
+    return r;
+  }
+
+  bool okFlag = false;
+  JsonGetBool(resp, "ok", okFlag);
+  std::string errA, hostA, userA, passA;
+  JsonGetString(resp, "error", errA);
+  JsonGetString(resp, "host", hostA);
+  JsonGetString(resp, "username", userA);
+  JsonGetString(resp, "password", passA);
+  int socks = 0, http = 0;
+  JsonGetNumber(resp, "socks_port", socks);
+  JsonGetNumber(resp, "http_port", http);
+
+  if (!okFlag || status != 200) {
+    r.ok = false;
+    if (!errA.empty()) r.message = Utf8ToWide(errA);
+    else r.message = L"Login failed (HTTP " + std::to_wstring(status) + L")";
+    return r;
+  }
+
+  // password field in JSON may match account response key "password" under proxy -
+  // our server puts RADIUS password under proxy.password; JsonGetString finds first "password"
+  // which is correct for our payload structure.
+
+  if (hostA.empty() || socks <= 0 || userA.empty() || passA.empty()) {
+    r.ok = false;
+    r.message = L"Login OK but proxy details incomplete from server.";
+    return r;
+  }
+
+  r.ok = true;
+  r.email = email;
+  r.host = Utf8ToWide(hostA);
+  r.socksPort = socks;
+  r.httpPort = http;
+  r.proxyUser = Utf8ToWide(userA);
+  r.proxyPass = Utf8ToWide(passA);
+
+  // optional usage numbers (may be floats in JSON - atoi still works for leading digits)
+  int total = 0, thresh = 0;
+  JsonGetNumber(resp, "total_mb", total);
+  JsonGetNumber(resp, "threshold_mb", thresh);
+  r.usedMb = total;
+  r.limitMb = thresh;
+  r.message = L"Loaded proxy for " + email;
+  return r;
 }
 
 struct UpdateCheckResult {
@@ -441,6 +634,7 @@ static void ShowAboutDialog(HWND parent) {
   msg += L"UK residential proxy connectivity and speed test tool.\r\n";
   msg += L"Built for ProxyPi — https://proxypi.co.uk\r\n\r\n";
   msg += L"Features:\r\n";
+  msg += L"  - Login to load your assigned ProxyPi node\r\n";
   msg += L"  - SOCKS5 / HTTP proxy test (exit IP + latency)\r\n";
   msg += L"  - Download speed test through your proxy\r\n";
   msg += L"  - Optional update checks via public GitHub feed\r\n\r\n";
@@ -476,6 +670,29 @@ static void DoCheckUpdates(bool silent) {
     r.silent = silent;
     auto* heap = new UpdateCheckResult(std::move(r));
     PostMessageW(hMain, WM_APP_UPDATE_DONE, 0, (LPARAM)heap);
+  }).detach();
+}
+
+static void DoLoginLoadProxy() {
+  if (g_busy) return;
+  wchar_t emailBuf[512] = {}, passBuf[512] = {};
+  GetWindowTextW(hAcctEmail, emailBuf, 512);
+  GetWindowTextW(hAcctPass, passBuf, 512);
+  std::wstring email = emailBuf;
+  std::wstring pass = passBuf;
+  if (email.empty() || pass.empty()) {
+    SetStatus(L"Enter your ProxyPi account email and password.", COL_ERROR);
+    return;
+  }
+  SetBusy(true);
+  if (hBtnLogin) EnableWindow(hBtnLogin, FALSE);
+  SetStatus(L"Logging in and loading your assigned proxy...", COL_PRIMARY);
+  AppendResult(L"--- Account login ---");
+
+  std::thread([email, pass]() {
+    DesktopLoginResult r = PerformDesktopLogin(email, pass);
+    auto* heap = new DesktopLoginResult(std::move(r));
+    PostMessageW(hMain, WM_APP_LOGIN_DONE, 0, (LPARAM)heap);
   }).detach();
 }
 
@@ -729,18 +946,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       hBrushInput = CreateSolidBrush(COL_BG_DEEP);
       hBrushPrimary = CreateSolidBrush(COL_PRIMARY);
 
-      // Layout Y positions (controls sit on painted cards)
-      // Config card: y=120, height ~210
-      // Metric cards: y=350
-      // Buttons: y=440
-      // Result card: y=500
+      // Layout:
+      // Account card  y=112..250
+      // Config card   y=262..470
+      // Metrics       y=482
+      // Action buttons y=572
+      // Results       y=660..CLIENT_H-88
 
       int labelX = CARD_X + 18;
       int fieldX = CARD_X + 110;
       int fieldW = CARD_W - 130;
-      int y = 158;
       int rowH = 32;
-      int gapY = 36;
+      int gapY = 34;
 
       auto mkLabel = [&](const wchar_t* t, int ly) {
         HWND s = CreateWindowW(L"STATIC", t, WS_CHILD | WS_VISIBLE,
@@ -749,6 +966,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return s;
       };
 
+      // --- Account login ---
+      int y = 148;
+      mkLabel(L"Email", y);
+      hAcctEmail = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_ACCT_EMAIL, nullptr, nullptr);
+      SendMessageW(hAcctEmail, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+
+      y += gapY;
+      mkLabel(L"Password", y);
+      hAcctPass = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
+        fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_ACCT_PASS, nullptr, nullptr);
+      SendMessageW(hAcctPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+
+      y += gapY + 4;
+      hBtnLogin = CreateStyledButton(hwnd, L"Login & Load My Proxy",
+        CARD_X + 18, y, CARD_W - 36, 36, ID_BTN_LOGIN, true);
+
+      // --- Proxy config ---
+      y = 298;
       mkLabel(L"Type", y);
       hComboType = CreateWindowW(L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -793,7 +1031,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       SendMessageW(hPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       // Primary actions
-      int btnY = 440;
+      int btnY = 572;
       int btnW = (CARD_W - 10) / 2;
       hBtnTest = CreateStyledButton(hwnd, L"Test Proxy", CARD_X, btnY, btnW, 42, ID_BTN_TEST, true);
       hBtnSpeed = CreateStyledButton(hwnd, L"Speed Test", CARD_X + btnW + 10, btnY, btnW, 42, ID_BTN_SPEED, true);
@@ -805,13 +1043,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       hBtnLoad = CreateStyledButton(hwnd, L"Reload", CARD_X + secW + 10, secY, secW, 34, ID_BTN_LOAD, false);
       hBtnSite = CreateStyledButton(hwnd, L"Website", CARD_X + (secW + 10) * 2, secY, secW, 34, ID_BTN_SITE, false);
 
-      // Result log (inside RESULTS card; leave room for status strip + footer below)
+      // Result log
       hResult = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-        CARD_X + 14, 560, CARD_W - 28, 110, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
+        CARD_X + 14, 700, CARD_W - 28, 90, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
       SendMessageW(hResult, WM_SETFONT, (WPARAM)hFontMono, TRUE);
 
-      // Status strip — inside client area (not below the window edge)
+      // Status strip
       hStatus = CreateWindowW(L"STATIC", g_statusText.c_str(),
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
         CARD_X + 8, CLIENT_H - 72, CARD_W - 16, 36, hwnd, (HMENU)ID_STATIC_STATUS, nullptr, nullptr);
@@ -854,15 +1092,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
       PaintHeader(mem, client.right);
 
+      // Account login card
+      RECT acctCard{ CARD_X, 112, CARD_X + CARD_W, 250 };
+      PaintCardChrome(mem, acctCard, L"PROXYPI ACCOUNT");
+
       // Config card
-      RECT cfgCard{ CARD_X, 120, CARD_X + CARD_W, 340 };
+      RECT cfgCard{ CARD_X, 262, CARD_X + CARD_W, 470 };
       PaintCardChrome(mem, cfgCard, L"PROXY CONFIGURATION");
 
       // Metric cards
-      PaintMetricCards(mem, 350);
+      PaintMetricCards(mem, 482);
 
       // Results card chrome
-      RECT resCard{ CARD_X, 530, CARD_X + CARD_W, CLIENT_H - 88 };
+      RECT resCard{ CARD_X, 670, CARD_X + CARD_W, CLIENT_H - 88 };
       PaintCardChrome(mem, resCard, L"RESULTS");
 
       // Status strip background
@@ -907,6 +1149,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND: {
       switch (LOWORD(wParam)) {
+        case ID_BTN_LOGIN:
+          DoLoginLoadProxy();
+          break;
         case ID_BTN_TEST:
           DoTest();
           break;
@@ -1003,6 +1248,53 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           AppendResult(L"  Duration  : " + std::to_wstring(r->downloadMs) + L" ms");
         } else {
           SetStatus(L"Speed test failed: " + r->message, COL_ERROR);
+          AppendResult(L"FAILED - " + r->message);
+        }
+        delete r;
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+
+    case WM_APP_LOGIN_DONE: {
+      DesktopLoginResult* r = reinterpret_cast<DesktopLoginResult*>(lParam);
+      SetBusy(false);
+      if (hBtnLogin) EnableWindow(hBtnLogin, TRUE);
+      if (r) {
+        if (r->ok) {
+          // Fill proxy form from assigned node
+          SetWindowTextW(hHost, r->host.c_str());
+          SetWindowTextW(hPort, std::to_wstring(r->socksPort).c_str());
+          SetWindowTextW(hUser, r->proxyUser.c_str());
+          SetWindowTextW(hPass, r->proxyPass.c_str());
+          SendMessageW(hComboType, CB_SETCURSEL, 0, 0); // SOCKS5 default
+          SendMessageW(hCheckAuth, BM_SETCHECK, BST_CHECKED, 0);
+          EnableWindow(hUser, TRUE);
+          EnableWindow(hPass, TRUE);
+
+          // Remember account email only (not account password)
+          // (proxy settings can be saved via Save button)
+
+          std::wstring usage;
+          if (r->limitMb > 0) {
+            usage = L"  Usage ~ " + std::to_wstring((int)r->usedMb) + L" / " +
+                    std::to_wstring((int)r->limitMb) + L" MB";
+          }
+          SetStatus(L"Loaded " + r->host + L":" + std::to_wstring(r->socksPort) + usage, COL_SUCCESS);
+          AppendResult(L"SUCCESS - account login");
+          AppendResult(L"  Email      : " + r->email);
+          AppendResult(L"  Proxy host : " + r->host);
+          AppendResult(L"  SOCKS port : " + std::to_wstring(r->socksPort));
+          if (r->httpPort > 0)
+            AppendResult(L"  HTTP port  : " + std::to_wstring(r->httpPort));
+          AppendResult(L"  Username   : " + r->proxyUser);
+          AppendResult(L"  Password   : (loaded - use Test / Speed Test)");
+          if (r->limitMb > 0)
+            AppendResult(L"  Plan usage : " + std::to_wstring((int)r->usedMb) + L" / " +
+                         std::to_wstring((int)r->limitMb) + L" MB");
+          AppendResult(L"Tip: click Test Proxy next.");
+        } else {
+          SetStatus(L"Login failed: " + r->message, COL_ERROR);
           AppendResult(L"FAILED - " + r->message);
         }
         delete r;

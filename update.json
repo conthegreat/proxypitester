@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "download_url": "https://github.com/conthegreat/proxypitester/releases/latest",
-  "notes": "Initial public release - connectivity test, speed test, About menu, update checks."
+  "notes": "Login & Load My Proxy via proxypi.co.uk account. Auto-fills assigned node + SOCKS credentials."
 }
