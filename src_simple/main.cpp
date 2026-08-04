@@ -114,6 +114,41 @@ static std::wstring g_lastIp;
 static int g_lastLatency = 0;
 static double g_lastMbps = -1.0;  // -1 = not measured
 static std::wstring g_lastDetail;
+static bool g_showedDnsTip = false;
+
+static void AppendResult(const std::wstring& text); // forward decl
+
+static void MaybeAppendDnsLatencyTip() {
+  if (g_showedDnsTip) return;
+  g_showedDnsTip = true;
+  AppendResult(L"Note: the first test can look slower because of DNS lookup and a cold proxy path.");
+  AppendResult(L"      Later tests to the same host are usually quicker.");
+}
+
+// Ports from last account login (or sensible defaults) so Type can swap SOCKS <-> HTTP
+static int g_socksPort = 18721;
+static int g_httpPort = 58920;
+
+static void ApplyPortForSelectedType() {
+  if (!hComboType || !hPort) return;
+  int sel = (int)SendMessageW(hComboType, CB_GETCURSEL, 0, 0);
+  if (sel < 0) sel = 0;
+  // Ensure we always have a usable pair after login
+  int socks = (g_socksPort > 0) ? g_socksPort : 18721;
+  int http  = (g_httpPort  > 0) ? g_httpPort  : 58920;
+  int port = (sel == 1) ? http : socks;
+  SetWindowTextW(hPort, std::to_wstring(port).c_str());
+}
+
+// Call when both ports are known (login success) — stores pair and refreshes Port field once
+static void SetPortPairAndRefresh(int socksPort, int httpPort) {
+  if (socksPort > 0) g_socksPort = socksPort;
+  if (httpPort > 0)  g_httpPort  = httpPort;
+  // If API only returned one, keep the other default so swapping still works
+  if (g_socksPort <= 0) g_socksPort = 18721;
+  if (g_httpPort  <= 0) g_httpPort  = 58920;
+  ApplyPortForSelectedType();
+}
 
 // Layout constants (CLIENT area size — window chrome is added via AdjustWindowRectEx)
 static const int CLIENT_W = 560;
@@ -208,6 +243,12 @@ static void WriteConfigToUI(const ProxyConfig& cfg) {
   SendMessageW(hComboType, CB_SETCURSEL, cfg.type == ProxyType::HTTP ? 1 : 0, 0);
   SetWindowTextW(hHost, cfg.host.c_str());
   SetWindowTextW(hPort, std::to_wstring(cfg.port).c_str());
+  // Keep port pair in sync so Type can swap later
+  if (cfg.type == ProxyType::HTTP) {
+    if (cfg.port > 0) g_httpPort = cfg.port;
+  } else {
+    if (cfg.port > 0) g_socksPort = cfg.port;
+  }
   SendMessageW(hCheckAuth, BM_SETCHECK, cfg.useAuth ? BST_CHECKED : BST_UNCHECKED, 0);
   SetWindowTextW(hUser, cfg.username.c_str());
   SetWindowTextW(hPass, cfg.password.c_str());
@@ -328,16 +369,41 @@ static std::string WideToUtf8(const std::wstring& w) {
   return s;
 }
 
+// Strict "key": number extractor (avoids matching digits inside other keys/values)
 static bool JsonGetNumber(const std::string& json, const char* key, int& out) {
-  std::string pat = std::string("\"") + key + "\"";
-  size_t p = json.find(pat);
-  if (p == std::string::npos) return false;
-  p = json.find(':', p + pat.size());
-  if (p == std::string::npos) return false;
-  p = json.find_first_of("0123456789-", p + 1);
-  if (p == std::string::npos) return false;
-  out = atoi(json.c_str() + p);
-  return true;
+  std::string needle = std::string("\"") + key + "\"";
+  size_t pos = 0;
+  while ((pos = json.find(needle, pos)) != std::string::npos) {
+    size_t k = pos + needle.size();
+    while (k < json.size() && (json[k] == ' ' || json[k] == '\t' || json[k] == '\r' || json[k] == '\n')) k++;
+    if (k >= json.size() || json[k] != ':') { ++pos; continue; }
+    ++k;
+    while (k < json.size() && (json[k] == ' ' || json[k] == '\t' || json[k] == '\r' || json[k] == '\n')) k++;
+    if (k < json.size() && (isdigit((unsigned char)json[k]) || json[k] == '-')) {
+      out = atoi(json.c_str() + k);
+      return true;
+    }
+    ++pos;
+  }
+  return false;
+}
+
+// Extract a top-level object value for key "proxy": { ... }
+static std::string JsonExtractObject(const std::string& json, const char* key) {
+  std::string needle = std::string("\"") + key + "\"";
+  size_t p = json.find(needle);
+  if (p == std::string::npos) return {};
+  p = json.find('{', p + needle.size());
+  if (p == std::string::npos) return {};
+  int depth = 0;
+  for (size_t i = p; i < json.size(); ++i) {
+    if (json[i] == '{') depth++;
+    else if (json[i] == '}') {
+      depth--;
+      if (depth == 0) return json.substr(p, i - p + 1);
+    }
+  }
+  return {};
 }
 
 static bool JsonGetBool(const std::string& json, const char* key, bool& out) {
@@ -518,12 +584,19 @@ static DesktopLoginResult PerformDesktopLogin(const std::wstring& email, const s
   JsonGetBool(resp, "ok", okFlag);
   std::string errA, hostA, userA, passA;
   JsonGetString(resp, "error", errA);
-  JsonGetString(resp, "host", hostA);
-  JsonGetString(resp, "username", userA);
-  JsonGetString(resp, "password", passA);
+
+  // Parse proxy object first so both ports are read in one go (not mixed with usage fields)
+  std::string proxyObj = JsonExtractObject(resp, "proxy");
+  const std::string& proxyJson = !proxyObj.empty() ? proxyObj : resp;
+
+  JsonGetString(proxyJson, "host", hostA);
+  JsonGetString(proxyJson, "username", userA);
+  JsonGetString(proxyJson, "password", passA);
   int socks = 0, http = 0;
-  JsonGetNumber(resp, "socks_port", socks);
-  JsonGetNumber(resp, "http_port", http);
+  JsonGetNumber(proxyJson, "socks_port", socks);
+  JsonGetNumber(proxyJson, "http_port", http);
+  // Fallback: some older payloads used "port" for SOCKS only
+  if (socks <= 0) JsonGetNumber(proxyJson, "port", socks);
 
   if (!okFlag || status != 200) {
     r.ok = false;
@@ -532,21 +605,19 @@ static DesktopLoginResult PerformDesktopLogin(const std::wstring& email, const s
     return r;
   }
 
-  // password field in JSON may match account response key "password" under proxy -
-  // our server puts RADIUS password under proxy.password; JsonGetString finds first "password"
-  // which is correct for our payload structure.
-
   if (hostA.empty() || socks <= 0 || userA.empty() || passA.empty()) {
     r.ok = false;
     r.message = L"Login OK but proxy details incomplete from server.";
     return r;
   }
+  // HTTP port may be missing on some nodes — keep a usable default so Type swap still works
+  if (http <= 0) http = 58920;
 
   r.ok = true;
   r.email = email;
   r.host = Utf8ToWide(hostA);
   r.socksPort = socks;
-  r.httpPort = http;
+  r.httpPort = http; // both always set on success
   r.proxyUser = Utf8ToWide(userA);
   r.proxyPass = Utf8ToWide(passA);
 
@@ -628,20 +699,14 @@ static UpdateCheckResult PerformUpdateCheck() {
 
 static void ShowAboutDialog(HWND parent) {
   std::wstring msg;
-  msg += L"ProxyPiTester  v";
+  msg += L"ProxyPiTester\r\n";
+  msg += L"Version ";
   msg += APP_VERSION;
   msg += L"\r\n\r\n";
-  msg += L"UK residential proxy connectivity and speed test tool.\r\n";
-  msg += L"Built for ProxyPi — https://proxypi.co.uk\r\n\r\n";
-  msg += L"Features:\r\n";
-  msg += L"  - Login to load your assigned ProxyPi node\r\n";
-  msg += L"  - SOCKS5 / HTTP proxy test (exit IP + latency)\r\n";
-  msg += L"  - Download speed test through your proxy\r\n";
-  msg += L"  - Optional update checks via public GitHub feed\r\n\r\n";
-  msg += L"No credentials are embedded in this app.\r\n";
-  msg += L"Your host/user/password stay on your PC only.\r\n\r\n";
-  msg += L"(c) ProxyPi  |  Help > Check for Updates for new builds";
-  MessageBoxW(parent, msg.c_str(), L"About ProxyPiTester", MB_OK | MB_ICONINFORMATION);
+  msg += L"Proxy connectivity and speed tests for ProxyPi.\r\n";
+  msg += L"https://proxypi.co.uk\r\n";
+  msg += L"Support: support@proxypi.co.uk\r\n";
+  MessageBoxW(parent, msg.c_str(), L"About", MB_OK | MB_ICONINFORMATION);
 }
 
 static HMENU CreateAppMenu() {
@@ -786,7 +851,7 @@ static LRESULT CALLBACK BtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 static HWND CreateStyledButton(HWND parent, const wchar_t* text, int x, int y, int w, int h,
                                int id, bool primary) {
   HWND btn = CreateWindowW(L"BUTTON", text,
-    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
     x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
   SetWindowLongPtrW(btn, GWLP_USERDATA, primary ? 1 : 0);
   SetWindowSubclass(btn, BtnProc, 1, 0);
@@ -970,26 +1035,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       int y = 148;
       mkLabel(L"Email", y);
       hAcctEmail = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_ACCT_EMAIL, nullptr, nullptr);
       SendMessageW(hAcctEmail, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       y += gapY;
       mkLabel(L"Password", y);
       hAcctPass = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
         fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_ACCT_PASS, nullptr, nullptr);
       SendMessageW(hAcctPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       y += gapY + 4;
-      hBtnLogin = CreateStyledButton(hwnd, L"Login & Load My Proxy",
+      // Note: do not use single '&' in labels — Win32 treats it as accelerator (shows as underline)
+      hBtnLogin = CreateStyledButton(hwnd, L"Login and Load My Proxy",
         CARD_X + 18, y, CARD_W - 36, 36, ID_BTN_LOGIN, true);
 
       // --- Proxy config ---
       y = 298;
       mkLabel(L"Type", y);
       hComboType = CreateWindowW(L"COMBOBOX", nullptr,
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
         fieldX, y, 160, 200, hwnd, (HMENU)ID_COMBO_TYPE, nullptr, nullptr);
       SendMessageW(hComboType, CB_ADDSTRING, 0, (LPARAM)L"SOCKS5");
       SendMessageW(hComboType, CB_ADDSTRING, 0, (LPARAM)L"HTTP / HTTPS");
@@ -999,19 +1065,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       y += gapY;
       mkLabel(L"Host", y);
       hHost = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_HOST, nullptr, nullptr);
       SendMessageW(hHost, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       y += gapY;
       mkLabel(L"Port", y);
       hPort = CreateWindowW(L"EDIT", L"18721",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
         fieldX, y, 100, rowH, hwnd, (HMENU)ID_EDIT_PORT, nullptr, nullptr);
       SendMessageW(hPort, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       hCheckAuth = CreateWindowW(L"BUTTON", L"  Authentication",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         fieldX + 120, y + 4, 160, 24, hwnd, (HMENU)ID_CHECK_AUTH, nullptr, nullptr);
       SendMessageW(hCheckAuth, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
       SendMessageW(hCheckAuth, BM_SETCHECK, BST_CHECKED, 0);
@@ -1019,14 +1085,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       y += gapY;
       mkLabel(L"Username", y);
       hUser = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_USER, nullptr, nullptr);
       SendMessageW(hUser, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
       y += gapY;
       mkLabel(L"Password", y);
       hPass = CreateWindowW(L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
         fieldX, y, fieldW, rowH, hwnd, (HMENU)ID_EDIT_PASS, nullptr, nullptr);
       SendMessageW(hPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
 
@@ -1044,6 +1110,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       hBtnSite = CreateStyledButton(hwnd, L"Website", CARD_X + (secW + 10) * 2, secY, secW, 34, ID_BTN_SITE, false);
 
       // Result log
+      // No WS_TABSTOP on results — multiline would trap Tab; skip so Tab stays on inputs/buttons
       hResult = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
         CARD_X + 14, 700, CARD_W - 28, 90, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
@@ -1071,8 +1138,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
       AppendResult(L"ProxyPiTester ready.");
       AppendResult(L"SOCKS5 + auth is recommended for residential nodes.");
+      AppendResult(L"Tip: first test latency is often higher (DNS + first connection through the proxy).");
       // Quiet background update check (only prompts if a newer version is published)
       DoCheckUpdates(true);
+      // Start keyboard focus on account email for Tab navigation
+      if (hAcctEmail) SetFocus(hAcctEmail);
       return 0;
     }
 
@@ -1152,6 +1222,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case ID_BTN_LOGIN:
           DoLoginLoadProxy();
           break;
+        case ID_COMBO_TYPE: {
+          // Handle all selection notifications so port swaps reliably
+          const WORD note = HIWORD(wParam);
+          if (note == CBN_SELCHANGE || note == CBN_SELENDOK || note == CBN_CLOSEUP || note == CBN_SELENDCANCEL) {
+            ApplyPortForSelectedType();
+          }
+          break;
+        }
         case ID_BTN_TEST:
           DoTest();
           break;
@@ -1214,6 +1292,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           AppendResult(L"SUCCESS");
           AppendResult(L"  Exit IP : " + r->detectedIp);
           AppendResult(L"  Latency : " + std::to_wstring(r->latencyMs) + L" ms");
+          MaybeAppendDnsLatencyTip();
         } else {
           SetStatus(L"Test failed: " + r->message, COL_ERROR);
           AppendResult(L"FAILED - " + r->message);
@@ -1246,6 +1325,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           AppendResult(L"  Download  : " + std::wstring(speed) + L" Mbps");
           AppendResult(L"  Bytes     : " + std::to_wstring((long long)r->bytesDownloaded));
           AppendResult(L"  Duration  : " + std::to_wstring(r->downloadMs) + L" ms");
+          MaybeAppendDnsLatencyTip();
         } else {
           SetStatus(L"Speed test failed: " + r->message, COL_ERROR);
           AppendResult(L"FAILED - " + r->message);
@@ -1262,37 +1342,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       if (hBtnLogin) EnableWindow(hBtnLogin, TRUE);
       if (r) {
         if (r->ok) {
-          // Fill proxy form from assigned node
+          // Store BOTH ports from this single login, then fill the form
+          SetPortPairAndRefresh(r->socksPort, r->httpPort);
+
           SetWindowTextW(hHost, r->host.c_str());
-          SetWindowTextW(hPort, std::to_wstring(r->socksPort).c_str());
           SetWindowTextW(hUser, r->proxyUser.c_str());
           SetWindowTextW(hPass, r->proxyPass.c_str());
-          SendMessageW(hComboType, CB_SETCURSEL, 0, 0); // SOCKS5 default
+          SendMessageW(hComboType, CB_SETCURSEL, 0, 0); // default SOCKS5
+          SetPortPairAndRefresh(r->socksPort, r->httpPort); // apply SOCKS port now that type is set
           SendMessageW(hCheckAuth, BM_SETCHECK, BST_CHECKED, 0);
           EnableWindow(hUser, TRUE);
           EnableWindow(hPass, TRUE);
 
-          // Remember account email only (not account password)
-          // (proxy settings can be saved via Save button)
-
           std::wstring usage;
           if (r->limitMb > 0) {
-            usage = L"  Usage ~ " + std::to_wstring((int)r->usedMb) + L" / " +
+            usage = L"  " + std::to_wstring((int)r->usedMb) + L"/" +
                     std::to_wstring((int)r->limitMb) + L" MB";
           }
-          SetStatus(L"Loaded " + r->host + L":" + std::to_wstring(r->socksPort) + usage, COL_SUCCESS);
-          AppendResult(L"SUCCESS - account login");
+          // Status shows both ports loaded in one go
+          SetStatus(L"Loaded " + r->host + L" | SOCKS " + std::to_wstring(g_socksPort) +
+                    L" | HTTP " + std::to_wstring(g_httpPort) + usage, COL_SUCCESS);
+          AppendResult(L"SUCCESS - account login (both ports loaded)");
           AppendResult(L"  Email      : " + r->email);
           AppendResult(L"  Proxy host : " + r->host);
-          AppendResult(L"  SOCKS port : " + std::to_wstring(r->socksPort));
-          if (r->httpPort > 0)
-            AppendResult(L"  HTTP port  : " + std::to_wstring(r->httpPort));
+          AppendResult(L"  SOCKS port : " + std::to_wstring(g_socksPort));
+          AppendResult(L"  HTTP port  : " + std::to_wstring(g_httpPort));
           AppendResult(L"  Username   : " + r->proxyUser);
-          AppendResult(L"  Password   : (loaded - use Test / Speed Test)");
+          AppendResult(L"  Password   : (loaded)");
           if (r->limitMb > 0)
             AppendResult(L"  Plan usage : " + std::to_wstring((int)r->usedMb) + L" / " +
                          std::to_wstring((int)r->limitMb) + L" MB");
-          AppendResult(L"Tip: click Test Proxy next.");
+          AppendResult(L"Both ports ready - switch Type (SOCKS5 / HTTP) anytime, no re-login needed.");
         } else {
           SetStatus(L"Login failed: " + r->message, COL_ERROR);
           AppendResult(L"FAILED - " + r->message);
@@ -1404,7 +1484,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   int y = (sy - winH) / 2;
 
   HWND hwnd = CreateWindowExW(
-    0, L"ProxyPiTesterMain",
+    WS_EX_CONTROLPARENT, L"ProxyPiTesterMain",
     L"ProxyPiTester",
     style,
     x, y, winW, winH,
@@ -1423,6 +1503,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
   MSG msg;
   while (GetMessage(&msg, nullptr, 0, 0)) {
+    // Enables Tab / Shift+Tab between email, password, and other controls
+    if (hMain && IsDialogMessageW(hMain, &msg)) {
+      continue;
+    }
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }

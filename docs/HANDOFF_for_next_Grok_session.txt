@@ -1,0 +1,253 @@
+================================================================================
+PROXYPI TESTER + PRODUCTION API — HANDOFF FOR NEXT GROK SESSION
+Last updated: 2026-08-04 (reconciled by Grok: rate limit LIVE + website.py on GitHub)
+================================================================================
+
+PURPOSE OF THIS FILE
+--------------------
+Context dump so another Grok (or developer) can continue without re-discovering
+the project. Covers: desktop app, GitHub, production server change, and why
+things were done the way they were.
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+Product: ProxyPiTester — Windows desktop app for ProxyPi customers
+  - Login with website email/password
+  - Load assigned residential proxy (host, SOCKS port, HTTP port, RADIUS user/pass)
+  - Test connectivity (exit IP + latency)
+  - Speed test (~1 MB download Mbps)
+  - SOCKS5 vs HTTP type switch (swaps port)
+  - Save/load local settings (ProxyPiTester.ini next to exe)
+  - Help menu: About, Website, Check for Updates
+  - Public download via GitHub Releases
+
+Website: https://proxypi.co.uk
+Support: support@proxypi.co.uk
+Branding: dark UI (#0f172a / #111827), accent cyan #00bcd4
+
+
+================================================================================
+2. LOCAL CODE LOCATIONS (Windows machine)
+================================================================================
+
+Main workspace:
+  C:\Users\conno\Downloads\Proxytools\
+
+Desktop app (simple tester — THIS is the product for the website):
+  src_simple\main.cpp          — Win32 GUI + login + tests + updates
+  src\proxy_client.cpp / .h    — SOCKS5/HTTP client, TestProxy, SpeedTestProxy
+  src\common.cpp / .h          — shared types, optional hook config (not needed for tester)
+  ProxyPiTester.vcxproj
+  assets\ProxyPiTester.ico
+  update.json                  — version feed for in-app updates
+
+Build output (ship this):
+  bin\Release\ProxyPiTester.exe
+  dist\ProxyPiTester-v1.1.0-win64.zip
+  dist\ProxyPiTester-screenshot-website.png   — marketing shot (creds/IP/ports blurred)
+  dist\ProxyPiTester-screenshot-raw.png       — DO NOT publish (may show secrets)
+
+FULL experimental app still in same folder (NOT the website download product):
+  src\main.cpp, process_utils.*, proxyhook.*  — DLL inject / app routing (Chrome etc.)
+  ProxyTools.sln / ProxyTools.vcxproj
+  Left intact; browsers never fully reliable with injection — abandoned for product focus.
+
+Secrets / DO NOT COMMIT:
+  proxydetails.txt
+  "ssh details for proxypi.txt"   — server root + SQL + git username (sensitive)
+  **/ProxyPiTester.ini
+  **/ProxyTools.ini
+
+Related ProxyPi website/API code on this machine (reference, separate repos):
+  C:\Users\conno\Downloads\ProxyPi_to_git\
+  C:\Users\conno\Downloads\ProxyPi_local_dev\
+
+
+================================================================================
+3. GITHUB
+================================================================================
+
+Desktop app repo (public):
+  https://github.com/conthegreat/proxypitester
+  Branch: main
+  Releases: v1.0.0, v1.1.0
+  Latest zip:
+    https://github.com/conthegreat/proxypitester/releases/download/v1.1.0/ProxyPiTester-v1.1.0-win64.zip
+  update.json on main (app checks this for updates):
+    https://raw.githubusercontent.com/conthegreat/proxypitester/main/update.json
+
+Pushed to GitHub (desktop only):
+  Source for ProxyPiTester, README, update.json, icon, docs — NO proxy credentials
+
+Website / production API repo:
+  https://github.com/conthegreat/proxypi
+  /api/desktop/login + rate limiting are NOW in website.py on GitHub main
+  (committed 2026-08-04). Live server matches. Future deploys from GitHub are safe.
+
+
+================================================================================
+4. PRODUCTION SERVER CHANGE (DIRECT — NOT VIA GITHUB DEPLOY)
+================================================================================
+
+WHY:
+  Desktop app needed "Login and Load My Proxy".
+  Production architecture:
+    - Public: nginx → gunicorn website.py on 127.0.0.1:5000 (HTTPS 443)
+    - Internal only: radius-api app.py on port 5001 (check_credentials, get_proxy, etc.)
+    - Port 5001 is firewalled (not reachable from internet)
+  So the desktop cannot call 5001 directly. Needed a public HTTPS JSON endpoint
+  on the website that proxies to 5001 on localhost.
+
+WHAT WAS DONE (SSH as root to 87.106.110.122):
+  1. Backed up website.py:
+       /opt/proxypi/backups/website.py.bak_desktop_api_<timestamp>
+  2. Inserted route into /opt/proxypi/website.py:
+       POST /api/desktop/login
+  3. py_compile syntax check
+  4. systemctl restart proxypi.service
+
+ENDPOINT CONTRACT:
+  POST https://proxypi.co.uk/api/desktop/login
+  Content-Type: application/json
+  Body: { "email": "...", "password": "..." }   // website account credentials
+
+  Success 200:
+  {
+    "ok": true,
+    "email": "...",
+    "proxy": {
+      "host": "<dns_record>",
+      "socks_port": <int>,
+      "http_port": <int>,
+      "username": "<RADIUS username>",
+      "password": "<RADIUS password>"
+    },
+    "usage": {
+      "total_mb": ...,
+      "threshold_mb": ...,
+      "status": "...",
+      "trial_status": "...",
+      "rotation_mode": "..."
+    }
+  }
+
+  Failures:
+    400 missing fields
+    401 invalid email/password
+    404 no active plan / no proxy assigned
+    502 incomplete data / internal API error
+
+  Internally the website calls RADIUS_API_URL (default http://127.0.0.1:5001):
+    GET /check_credentials?username=&password=
+    GET /get_usage?user_email=
+    GET /get_password?username=   (if password not already in usage)
+    GET /get_proxy?user_email=
+
+  Note: internal API still uses GET + password in query string for check_credentials
+  (pre-existing website pattern). Desktop login itself uses POST JSON over HTTPS.
+
+SERVICES:
+  proxypi.service     → gunicorn website:app on :5000
+  radius-api.service  → python app.py on :5001
+  nginx               → 443 → 5000
+
+RECONCILE WITH GITHUB (USER SHOULD DO):
+  Copy the /api/desktop/login block from production website.py into the
+  GitHub-managed website repo, commit, and deploy so the next GitHub deploy
+  does not wipe the live endpoint.
+
+
+================================================================================
+5. DESKTOP APP BEHAVIOUR (v1.1.x)
+================================================================================
+
+Login flow:
+  User enters ProxyPi website email + password
+  App POSTs to https://proxypi.co.uk/api/desktop/login
+  On success: fills Host, SOCKS/HTTP ports (both stored), RADIUS user/pass, auth on
+  Type dropdown: SOCKS5 vs HTTP swaps g_socksPort / g_httpPort without re-login
+
+Tests:
+  Test Proxy → api.ipify.org via proxy → exit IP + latency
+  Speed Test → IP check + ~1MB download via speedtest.tele2.net → Mbps
+  Tip: first latency can be higher due to DNS + cold path
+
+UI:
+  Dark ProxyPi branding, About (version + support@proxypi.co.uk)
+  Tab navigation between fields (IsDialogMessage)
+  No "&" in "Login and Load My Proxy" (Win32 accelerator underline issue)
+
+Updates:
+  Quiet check on startup + Help → Check for Updates
+  Reads public update.json / GitHub Releases (no tokens in the client)
+
+Version constant: APP_VERSION in src_simple/main.cpp (was 1.1.0 at last ship)
+  Support line added to About; rebuild Release if not yet in published zip.
+
+
+================================================================================
+6. SECURITY / PRODUCT NOTES
+================================================================================
+
+- EXE is reverse-engineerable; treat client as public; secrets stay on server.
+- Download zip must never include ProxyPiTester.ini or proxydetails.
+- Production /api/desktop/login rate limiting (6) is LIVE:
+    10 fail / 15m / IP, 5 fail / 15m / email, 30 total / 15m / IP → HTTP 429
+    File store: /opt/proxypi/data/desktop_login_rl.json (fcntl lock, multi-worker)
+  - Token auth (7) still optional / future — see SERVER_PROMPT doc
+- Server credentials file on disk is highly sensitive (root, MySQL); do not commit.
+- Git push for proxypitester used Windows Credential Manager token for conthegreat
+  (not the server root password).
+
+
+================================================================================
+7. WHAT WAS INTENTIONALLY NOT DONE / ABANDONED
+================================================================================
+
+- Reliable Chrome/Firefox force-proxy via DLL injection (crashes / incomplete routing)
+- Full ProxyTools injector as the customer download product
+- Code signing (SmartScreen may still warn "unknown publisher")
+- Token auth (step 7) still not implemented
+- Code signing still not done
+
+
+================================================================================
+8. USEFUL COMMANDS
+================================================================================
+
+Build desktop (VS 2022 x64):
+  msbuild ProxyPiTester.vcxproj /p:Configuration=Release /p:Platform=x64
+
+Run:
+  bin\Release\ProxyPiTester.exe
+
+Smoke-test API:
+  curl -sS -X POST https://proxypi.co.uk/api/desktop/login ^
+    -H "Content-Type: application/json" ^
+    -d "{\"email\":\"nobody@example.com\",\"password\":\"bad\"}"
+  Expect: 401 {"ok":false,"error":"Invalid email or password"}
+
+Server (if reconciling):
+  ssh root@87.106.110.122
+  grep -n api_desktop_login /opt/proxypi/website.py
+  systemctl status proxypi.service radius-api.service nginx
+
+
+================================================================================
+9. SUGGESTED NEXT STEPS FOR THE OTHER GROK WINDOW
+================================================================================
+
+1. DONE: desktop login + rate limit on GitHub proxypi + live server.
+2. Optional: token auth (step 7) for v1.2 desktop refresh without re-password.
+3. Optional: ship v1.1.1 from local uncommitted main.cpp polish (port swap / DNS tip)
+   — push + rebuild Release zip + update update.json / GitHub Release.
+4. Website resources download button → GitHub latest release zip.
+5. Prefer GitHub → deploy; live website.py is now in sync with repo.
+
+
+================================================================================
+END OF HANDOFF
+================================================================================
