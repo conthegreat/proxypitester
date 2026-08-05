@@ -71,6 +71,8 @@ static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent gl
 #define ID_EDIT_ACCT_EMAIL 2014
 #define ID_EDIT_ACCT_PASS  2015
 #define ID_BTN_LOGIN       2016
+#define ID_BTN_DEV_CHROME  2017
+#define ID_STATIC_DEV_HINT 2018
 
 // Menu IDs
 #define IDM_FILE_EXIT       3001
@@ -95,6 +97,8 @@ static HWND hBtnSave = nullptr, hBtnLoad = nullptr, hBtnSite = nullptr;
 static HWND hResult = nullptr;
 static HWND hStatus = nullptr;
 static HWND hAcctEmail = nullptr, hAcctPass = nullptr, hBtnLogin = nullptr;
+static HWND hBtnDevChrome = nullptr;
+static HWND hDevHint = nullptr;
 
 static HFONT hFontUi = nullptr;
 static HFONT hFontTitle = nullptr;
@@ -154,10 +158,15 @@ static void SetPortPairAndRefresh(int socksPort, int httpPort) {
 
 // Layout constants (CLIENT area size — window chrome is added via AdjustWindowRectEx)
 static const int CLIENT_W = 560;
-static const int CLIENT_H = 900;
+static const int CLIENT_H = 980;
 static const int PAD = 24;
 static const int CARD_X = 20;
 static const int CARD_W = CLIENT_W - 40;
+
+// Dev card geometry (must match WM_CREATE control placement)
+static const int DEV_CARD_TOP = 668;
+static const int DEV_CARD_BOT = 748;
+static const int RES_CARD_TOP = 760;
 
 // ---- helpers ----
 static std::wstring GetExeDir() {
@@ -219,6 +228,7 @@ static void SetBusy(bool busy) {
   EnableWindow(hBtnSave, !busy);
   EnableWindow(hBtnLoad, !busy);
   if (hBtnLogin) EnableWindow(hBtnLogin, !busy);
+  if (hBtnDevChrome) EnableWindow(hBtnDevChrome, !busy);
 }
 
 static ProxyConfig ReadConfigFromUI() {
@@ -734,27 +744,27 @@ static HMENU CreateAppMenu() {
 }
 
 static void DoDevLaunchChrome() {
+  if (g_busy) return;
   ProxyConfig cfg = ReadConfigFromUI();
   if (cfg.host.empty()) {
     SetStatus(L"Configure or login to load a proxy first.", COL_ERROR);
-    MessageBoxW(hMain, L"Set proxy host/port (or Login and Load My Proxy first).", L"Dev", MB_ICONWARNING);
+    MessageBoxW(hMain,
+      L"Load a proxy first (Login and Load My Proxy), or enter host/port manually.",
+      L"Dev - Chrome", MB_ICONWARNING | MB_OK);
     return;
   }
-  SetStatus(L"Dev: starting Chrome via local SOCKS bridge...", COL_PRIMARY);
-  AppendResult(L"--- Dev: Launch Chrome (proxied) ---");
+  SetBusy(true);
+  SetStatus(L"Dev: starting local bridge and Chrome...", COL_PRIMARY);
+  AppendResult(L"--- Dev: Open Chrome (Proxied) ---");
   std::thread([cfg]() {
     DWORD pid = 0;
     std::wstring err;
-    if (LaunchChromeViaBridge(cfg, pid, err)) {
-      // Log from LaunchChromeViaBridge already posts [dev] lines
-      std::wstring msg = L"Dev: Chrome started (PID " + std::to_wstring(pid) + L"). Check ifconfig.me for proxy IP.";
-      // Post status via AppendResult path
-      auto* heap = new std::wstring(msg);
-      PostMessageW(hMain, WM_APP + 20, 1, (LPARAM)heap); // 1 = success
-    } else {
-      auto* heap = new std::wstring(L"Dev Chrome launch failed: " + err);
-      PostMessageW(hMain, WM_APP + 20, 0, (LPARAM)heap);
-    }
+    bool ok = LaunchChromeViaBridge(cfg, pid, err);
+    std::wstring msg = ok
+      ? (L"Chrome started (PID " + std::to_wstring(pid) + L"). ifconfig.me should show proxy IP.")
+      : (L"Chrome launch failed: " + err);
+    auto* heap = new std::wstring(msg);
+    PostMessageW(hMain, WM_APP + 20, ok ? 1 : 0, (LPARAM)heap);
   }).detach();
 }
 
@@ -1142,11 +1152,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       hBtnLoad = CreateStyledButton(hwnd, L"Reload", CARD_X + secW + 10, secY, secW, 34, ID_BTN_LOAD, false);
       hBtnSite = CreateStyledButton(hwnd, L"Website", CARD_X + (secW + 10) * 2, secY, secW, 34, ID_BTN_SITE, false);
 
+      // --- Dev card: Chrome routing (experimental, not a public product feature yet) ---
+      hDevHint = CreateWindowW(L"STATIC",
+        L"Experimental. Routes Google Chrome through a local SOCKS bridge (auth stays in ProxyPiTester).",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+        CARD_X + 18, DEV_CARD_TOP + 36, CARD_W - 36, 18, hwnd, (HMENU)ID_STATIC_DEV_HINT, nullptr, nullptr);
+      SendMessageW(hDevHint, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
+
+      hBtnDevChrome = CreateStyledButton(hwnd, L"Open Chrome (Proxied)",
+        CARD_X + 18, DEV_CARD_TOP + 58, CARD_W - 36, 38, ID_BTN_DEV_CHROME, false);
+
       // Result log
       // No WS_TABSTOP on results — multiline would trap Tab; skip so Tab stays on inputs/buttons
       hResult = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
-        CARD_X + 14, 700, CARD_W - 28, 90, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
+        CARD_X + 14, RES_CARD_TOP + 32, CARD_W - 28, 90, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
       SendMessageW(hResult, WM_SETFONT, (WPARAM)hFontMono, TRUE);
 
       // Status strip
@@ -1175,7 +1195,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       AppendResult(L"ProxyPiTester ready.");
       AppendResult(L"SOCKS5 + auth is recommended for residential nodes.");
       AppendResult(L"Tip: first test latency is often higher (DNS + first connection through the proxy).");
-      AppendResult(L"Dev: menu Dev > Launch Google Chrome (proxied) uses local SOCKS bridge.");
+      AppendResult(L"Dev: use Open Chrome (Proxied) after loading proxy settings.");
       // Quiet background update check (only prompts if a newer version is published)
       DoCheckUpdates(true);
       // Start keyboard focus on account email for Tab navigation
@@ -1210,8 +1230,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       // Metric cards
       PaintMetricCards(mem, 482);
 
+      // Dev card (experimental Chrome routing)
+      RECT devCard{ CARD_X, DEV_CARD_TOP, CARD_X + CARD_W, DEV_CARD_BOT };
+      PaintCardChrome(mem, devCard, L"DEV  ·  CHROME ROUTING");
+      // Subtle left accent bar for "dev" affordance
+      {
+        HBRUSH brA = CreateSolidBrush(COL_INDIGO);
+        RECT accent{ CARD_X + 2, DEV_CARD_TOP + 10, CARD_X + 6, DEV_CARD_BOT - 10 };
+        FillRect(mem, &accent, brA);
+        DeleteObject(brA);
+      }
+
       // Results card chrome
-      RECT resCard{ CARD_X, 670, CARD_X + CARD_W, CLIENT_H - 88 };
+      RECT resCard{ CARD_X, RES_CARD_TOP, CARD_X + CARD_W, CLIENT_H - 88 };
       PaintCardChrome(mem, resCard, L"RESULTS");
 
       // Status strip background
@@ -1258,6 +1289,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       switch (LOWORD(wParam)) {
         case ID_BTN_LOGIN:
           DoLoginLoadProxy();
+          break;
+        case ID_BTN_DEV_CHROME:
+        case IDM_DEV_CHROME:
+          DoDevLaunchChrome();
           break;
         case ID_COMBO_TYPE: {
           // Handle all selection notifications so port swaps reliably
@@ -1308,14 +1343,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_HELP_ABOUT:
           ShowAboutDialog(hwnd);
           break;
-        case IDM_DEV_CHROME:
-          DoDevLaunchChrome();
-          break;
       }
       return 0;
     }
 
     case WM_APP + 20: { // Dev Chrome launch finished
+      SetBusy(false);
       std::wstring* msg = reinterpret_cast<std::wstring*>(lParam);
       if (msg) {
         AppendResult(*msg);
