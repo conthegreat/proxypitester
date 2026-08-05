@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "proxy_client.h"
+#include "local_bridge.h"
 
 #include <commctrl.h>
 #include <windowsx.h>
@@ -24,7 +25,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.1.0";
+static const wchar_t* APP_VERSION = L"1.2.0-dev";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -76,6 +77,7 @@ static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent gl
 #define IDM_HELP_UPDATE     3010
 #define IDM_HELP_WEBSITE    3011
 #define IDM_HELP_ABOUT      3012
+#define IDM_DEV_CHROME      3020
 
 // Custom messages from worker threads
 #define WM_APP_TEST_DONE    (WM_APP + 10)
@@ -706,6 +708,7 @@ static void ShowAboutDialog(HWND parent) {
   msg += L"Proxy connectivity and speed tests for ProxyPi.\r\n";
   msg += L"https://proxypi.co.uk\r\n";
   msg += L"Support: support@proxypi.co.uk\r\n";
+  msg += L"\r\nDev menu: experimental Chrome routing.\r\n";
   MessageBoxW(parent, msg.c_str(), L"About", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -713,6 +716,7 @@ static HMENU CreateAppMenu() {
   HMENU hMenubar = CreateMenu();
   HMENU hFile = CreatePopupMenu();
   HMENU hHelp = CreatePopupMenu();
+  HMENU hDev = CreatePopupMenu();
 
   AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT, L"E&xit");
   AppendMenuW(hHelp, MF_STRING, IDM_HELP_UPDATE, L"Check for &Updates...");
@@ -720,9 +724,38 @@ static HMENU CreateAppMenu() {
   AppendMenuW(hHelp, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(hHelp, MF_STRING, IDM_HELP_ABOUT, L"&About ProxyPiTester");
 
+  // Dev-only experiments (not advertised as stable website features yet)
+  AppendMenuW(hDev, MF_STRING, IDM_DEV_CHROME, L"Launch Google Chrome (proxied)");
+
   AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hFile, L"&File");
   AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hHelp, L"&Help");
+  AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hDev, L"&Dev");
   return hMenubar;
+}
+
+static void DoDevLaunchChrome() {
+  ProxyConfig cfg = ReadConfigFromUI();
+  if (cfg.host.empty()) {
+    SetStatus(L"Configure or login to load a proxy first.", COL_ERROR);
+    MessageBoxW(hMain, L"Set proxy host/port (or Login and Load My Proxy first).", L"Dev", MB_ICONWARNING);
+    return;
+  }
+  SetStatus(L"Dev: starting Chrome via local SOCKS bridge...", COL_PRIMARY);
+  AppendResult(L"--- Dev: Launch Chrome (proxied) ---");
+  std::thread([cfg]() {
+    DWORD pid = 0;
+    std::wstring err;
+    if (LaunchChromeViaBridge(cfg, pid, err)) {
+      // Log from LaunchChromeViaBridge already posts [dev] lines
+      std::wstring msg = L"Dev: Chrome started (PID " + std::to_wstring(pid) + L"). Check ifconfig.me for proxy IP.";
+      // Post status via AppendResult path
+      auto* heap = new std::wstring(msg);
+      PostMessageW(hMain, WM_APP + 20, 1, (LPARAM)heap); // 1 = success
+    } else {
+      auto* heap = new std::wstring(L"Dev Chrome launch failed: " + err);
+      PostMessageW(hMain, WM_APP + 20, 0, (LPARAM)heap);
+    }
+  }).detach();
 }
 
 static void DoCheckUpdates(bool silent) {
@@ -1136,9 +1169,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WriteConfigToUI(cfg);
         SetStatus(L"Ready - enter your ProxyPi host, port and credentials.", COL_TEXT_DIM);
       }
+      SetLogWindow(hResult);
+      SetLogMainWindow(hwnd);
+
       AppendResult(L"ProxyPiTester ready.");
       AppendResult(L"SOCKS5 + auth is recommended for residential nodes.");
       AppendResult(L"Tip: first test latency is often higher (DNS + first connection through the proxy).");
+      AppendResult(L"Dev: menu Dev > Launch Google Chrome (proxied) uses local SOCKS bridge.");
       // Quiet background update check (only prompts if a newer version is published)
       DoCheckUpdates(true);
       // Start keyboard focus on account email for Tab navigation
@@ -1271,6 +1308,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_HELP_ABOUT:
           ShowAboutDialog(hwnd);
           break;
+        case IDM_DEV_CHROME:
+          DoDevLaunchChrome();
+          break;
+      }
+      return 0;
+    }
+
+    case WM_APP + 20: { // Dev Chrome launch finished
+      std::wstring* msg = reinterpret_cast<std::wstring*>(lParam);
+      if (msg) {
+        AppendResult(*msg);
+        SetStatus(*msg, wParam ? COL_SUCCESS : COL_ERROR);
+        delete msg;
+      }
+      return 0;
+    }
+
+    case WM_APP_LOG: { // thread-safe Log() from bridge workers
+      std::wstring* line = reinterpret_cast<std::wstring*>(lParam);
+      if (line) {
+        // line already has timestamp + \r\n from Log()
+        if (hResult && IsWindow(hResult)) {
+          int len = GetWindowTextLengthW(hResult);
+          SendMessageW(hResult, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+          SendMessageW(hResult, EM_REPLACESEL, FALSE, (LPARAM)line->c_str());
+        }
+        delete line;
       }
       return 0;
     }

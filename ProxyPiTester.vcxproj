@@ -90,11 +90,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\common.cpp" />
+    <ClCompile Include="src\local_bridge.cpp" />
     <ClCompile Include="src\proxy_client.cpp" />
     <ClCompile Include="src_simple\main.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\common.h" />
+    <ClInclude Include="src\local_bridge.h" />
     <ClInclude Include="src\proxy_client.h" />
     <ClInclude Include="src_simple\resource.h" />
   </ItemGroup>
