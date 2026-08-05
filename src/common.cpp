@@ -7,25 +7,56 @@
 
 static std::mutex g_logMutex;
 static HWND g_logEdit = nullptr; // set later by GUI
+static HWND g_logMain = nullptr; // main window for PostMessage
 
-void SetLogWindow(HWND hwnd) { g_logEdit = hwnd; }
+void SetLogWindow(HWND hwnd) {
+  g_logEdit = hwnd;
+  if (hwnd) g_logMain = GetAncestor(hwnd, GA_ROOT);
+}
+
+void SetLogMainWindow(HWND hwnd) { g_logMain = hwnd; }
+
+static void AppendLogLineToEdit(const std::wstring& line) {
+  if (!g_logEdit || !IsWindow(g_logEdit)) return;
+  int len = GetWindowTextLengthW(g_logEdit);
+  // Cap log size to avoid UI thrash
+  if (len > 80000) {
+    SendMessageW(g_logEdit, EM_SETSEL, 0, 20000);
+    SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+    len = GetWindowTextLengthW(g_logEdit);
+  }
+  SendMessageW(g_logEdit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+  SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+  SendMessageW(g_logEdit, EM_SCROLLCARET, 0, 0);
+}
 
 void Log(const std::wstring& msg) {
-  std::lock_guard<std::mutex> lock(g_logMutex);
   SYSTEMTIME st;
   GetLocalTime(&st);
   wchar_t ts[32];
   swprintf_s(ts, L"[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-
   std::wstring line = ts + msg + L"\r\n";
 
-  if (g_logEdit) {
-    int len = GetWindowTextLengthW(g_logEdit);
-    SendMessageW(g_logEdit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessageW(g_logEdit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
-    SendMessageW(g_logEdit, EM_SCROLLCARET, 0, 0);
-  }
   OutputDebugStringW(line.c_str());
+
+  if (!g_logEdit) return;
+
+  DWORD uiTid = GetWindowThreadProcessId(g_logEdit, nullptr);
+  if (GetCurrentThreadId() == uiTid) {
+    // UI thread: update directly (never block waiting on workers)
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    AppendLogLineToEdit(line);
+    return;
+  }
+
+  // Worker thread: MUST NOT SendMessage (deadlocks if UI holds any lock / is in Log).
+  // Post to main window; WndProc frees the string.
+  HWND target = g_logMain ? g_logMain : GetAncestor(g_logEdit, GA_ROOT);
+  if (!target || !IsWindow(target)) return;
+  auto* heap = new std::wstring(std::move(line));
+  if (!PostMessageW(target, WM_APP_LOG, 0, (LPARAM)heap)) {
+    delete heap;
+  }
 }
 
 std::wstring GetExeDir() {

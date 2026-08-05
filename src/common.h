@@ -60,6 +60,9 @@ std::wstring GetConfigPath();
 bool SaveConfigToIni(const ProxyConfig& cfg);
 bool LoadConfigFromIni(ProxyConfig& cfg);
 
-// Logging helper (thread safe simple)
+// Logging helper (thread-safe). Non-UI threads must not use SendMessage to the log.
 void Log(const std::wstring& msg);
 void SetLogWindow(HWND hwnd);
+// Main window that receives WM_APP_LOG (set with SetLogWindow or separately)
+void SetLogMainWindow(HWND hwnd);
+#define WM_APP_LOG (WM_APP + 50)
