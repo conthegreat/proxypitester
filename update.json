@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
-  "download_url": "https://github.com/conthegreat/proxypitester/releases/latest",
-  "notes": "Login & Load My Proxy via proxypi.co.uk account. Auto-fills assigned node + SOCKS credentials."
+  "version": "1.2.0",
+  "download_url": "https://github.com/conthegreat/proxypitester/releases/download/v1.2.0/ProxyPiTester-v1.2.0-win64.zip",
+  "notes": "App routing: Chrome, Edge, Brave, Firefox, Discord, RuneLite, Jagex. Multi-app shared SOCKS bridge, live Active Apps panel, Open URL via proxy, Copy exit IP. Login & Load My Proxy, connectivity + speed tests."
 }
