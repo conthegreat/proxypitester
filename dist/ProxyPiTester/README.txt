@@ -1,4 +1,4 @@
-ProxyPiTester v1.2.0
+ProxyPiTester v1.2.1
 ====================
 
 UK residential proxy test & app routing for ProxyPi.
@@ -7,30 +7,23 @@ https://proxypi.co.uk
 Quick start
 -----------
 1. Double-click ProxyPiTester.exe
-2. Log in with your ProxyPi account email/password
-3. Click "Login and Load My Proxy" to fill host, ports, credentials
-4. Test Proxy / Speed Test to verify exit IP and speed
-5. Use Active Apps to open Chrome, Edge, Brave, Firefox, Discord,
-   RuneLite, Jagex — or Browse a Chromium/Electron app
-6. Optional: paste a URL and click Open URL (opens via proxied browser)
-7. Copy IP copies exit IP + session notes for support
+2. Log in with your ProxyPi account
+3. Login and Load My Proxy
+4. Test Proxy / Speed Test
+5. Open apps from Active Apps (keep this app open while routing)
+
+Apps
+----
+Browsers: Chrome, Edge, Brave, Firefox, Opera, Vivaldi
+Chat/IDE: Discord, Slack, Teams, VS Code, Cursor
+Tools:    Postman, Thunderbird, Spotify
+Gaming:   RuneLite, Jagex
+Custom:   Browse Chromium/Electron .exe
 
 Tips
 ----
-- Keep ProxyPiTester open while routed apps are running (local bridge)
-- SOCKS5 + authentication is recommended for residential nodes
+- Fully quit Electron apps before launching from here (tray too)
+- Postman/VS Code use SOCKS env + IDE proxy settings
 - First latency test is often slower (DNS + cold path)
-- Fully quit Discord before launching it through the app
 
-Settings
---------
-Save / Reload stores ProxyPiTester.ini next to this EXE (your PC only).
-
-Updates
--------
-Help > Check for Updates
-
-Support
--------
-support@proxypi.co.uk
-https://proxypi.co.uk
+Support: support@proxypi.co.uk

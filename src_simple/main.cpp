@@ -27,7 +27,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.2.0";
+static const wchar_t* APP_VERSION = L"1.2.1";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -139,6 +139,7 @@ static HWND hBtnCopyIp = nullptr;
 static HWND hBtnBrowseApp = nullptr;
 static std::wstring g_chromePath; // empty = auto-detect
 static std::wstring g_customAppPath; // last browsed Chromium-like exe
+static int g_lastAppSel = 0;         // combo index remembered in ini
 
 static HFONT hFontUi = nullptr;
 static HFONT hFontTitle = nullptr;
@@ -210,7 +211,7 @@ static const int BTN_SECONDARY_W = 96;
 static const int BTN_LOGIN_W = 260;
 static const int BTN_LAUNCH_W = 110;
 static const int BTN_REFRESH_W = 96;
-static const int COMBO_APPS_W = 210;
+static const int COMBO_APPS_W = 230;
 static const int BTN_COPY_W = 100;
 static const int BTN_URL_W = 100;
 
@@ -314,26 +315,58 @@ static std::wstring ShortenPathForUi(const std::wstring& p, size_t maxChars = 52
 
 static void RefreshChromePathLabel() {
   if (!hChromePathLabel) return;
-  std::wstring rl = FindDefaultRuneLiteDir();
-  std::wstring jx = FindDefaultJagexLauncherPath();
   int bp = GetLocalAuthBridgePort();
   std::wstring line;
-  if (bp > 0)
-    line = L"Bridge 127.0.0.1:" + std::to_wstring(bp) + L" (shared)";
-  else
-    line = L"Bridge off - launch an app to start";
-  line += EffectiveChromePath().empty() ? L" | Ch?" : L" | Ch";
-  line += FindDefaultEdgePath().empty() ? L" Ed?" : L" Ed";
-  line += FindDefaultBravePath().empty() ? L" Br?" : L" Br";
-  line += FindDefaultFirefoxPath().empty() ? L" FF?" : L" FF";
-  line += FindDefaultDiscordPath().empty() ? L" Dc?" : L" Dc";
-  line += rl.empty() ? L" RL?" : L" RL";
-  line += jx.empty() ? L" Jx?" : L" Jx";
-  if (IsRuneLiteSocksWrapActive()) {
-    line += L" | wrap:";
-    line += std::to_wstring(GetRuneLiteSocksWrapPort());
+  if (bp > 0) {
+    line = L"Bridge UP  127.0.0.1:" + std::to_wstring(bp);
+    if (g_hasResult && !g_lastIp.empty())
+      line += L"  |  Exit IP " + g_lastIp;
+  } else {
+    line = L"Bridge off - open an app to start";
+    if (g_hasResult && !g_lastIp.empty())
+      line += L"  |  Last exit " + g_lastIp;
   }
+  if (IsRuneLiteSocksWrapActive())
+    line += L"  |  RuneLite wrap armed";
   SetWindowTextW(hChromePathLabel, line.c_str());
+}
+
+// Prompt if app already running (Electron apps ignore new proxy flags if already open)
+static bool ConfirmRelaunchIfRunning(const wchar_t* appName, const wchar_t* imageExe) {
+  if (!IsImageRunning(imageExe)) return true;
+  std::wstring msg = appName;
+  msg += L" is already running.\r\n\r\n";
+  msg += L"It will not pick up the proxy until you fully quit it (including tray icons),\r\n";
+  msg += L"then open it again from ProxyPiTester.\r\n\r\n";
+  msg += L"Launch anyway?";
+  return MessageBoxW(hMain, msg.c_str(), L"App already running",
+                     MB_YESNO | MB_ICONWARNING) == IDYES;
+}
+
+static void SaveAppRoutePrefs() {
+  std::wstring path = GetIniPath();
+  WritePrivateProfileStringW(L"AppRoute", L"LastAppSel",
+                             std::to_wstring(g_lastAppSel).c_str(), path.c_str());
+  wchar_t url[1024] = {};
+  if (hEditOpenUrl) GetWindowTextW(hEditOpenUrl, url, 1024);
+  WritePrivateProfileStringW(L"AppRoute", L"LastUrl", url, path.c_str());
+  if (!g_customAppPath.empty())
+    WritePrivateProfileStringW(L"AppRoute", L"CustomApp", g_customAppPath.c_str(), path.c_str());
+}
+
+static void LoadAppRoutePrefs() {
+  std::wstring path = GetIniPath();
+  g_lastAppSel = GetPrivateProfileIntW(L"AppRoute", L"LastAppSel", 0, path.c_str());
+  wchar_t url[1024] = {}, custom[MAX_PATH] = {};
+  GetPrivateProfileStringW(L"AppRoute", L"LastUrl", L"https://ifconfig.me", url, 1024, path.c_str());
+  GetPrivateProfileStringW(L"AppRoute", L"CustomApp", L"", custom, MAX_PATH, path.c_str());
+  g_customAppPath = custom;
+  if (hEditOpenUrl && url[0]) SetWindowTextW(hEditOpenUrl, url);
+  if (hComboApps) {
+    int count = (int)SendMessageW(hComboApps, CB_GETCOUNT, 0, 0);
+    if (g_lastAppSel >= 0 && g_lastAppSel < count)
+      SendMessageW(hComboApps, CB_SETCURSEL, g_lastAppSel, 0);
+  }
 }
 
 // Fixed-width cell for mono listbox columns (Consolas)
@@ -350,13 +383,20 @@ static void RefreshSessionList() {
 
   // Status lines (full width, not columns)
   if (bp > 0) {
-    std::wstring head = L"Bridge  127.0.0.1:" + std::to_wstring(bp) + L"  (shared by all apps below)";
+    std::wstring head = L"Bridge UP   127.0.0.1:" + std::to_wstring(bp);
+    if (g_hasResult && !g_lastIp.empty())
+      head += L"   Exit IP " + g_lastIp;
+    else
+      head += L"   (run Test Proxy for exit IP)";
     SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)head.c_str());
   } else {
-    SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)L"Bridge  off  -  open an app to start");
+    std::wstring head = L"Bridge OFF  - open an app to start";
+    if (g_hasResult && !g_lastIp.empty())
+      head += L"   Last exit " + g_lastIp;
+    SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)head.c_str());
   }
   if (IsRuneLiteSocksWrapActive()) {
-    std::wstring w = L"Wrap    RuneLite SOCKS armed on port " +
+    std::wstring w = L"Wrap        RuneLite SOCKS armed on port " +
                      std::to_wstring(GetRuneLiteSocksWrapPort());
     SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)w.c_str());
   }
@@ -368,12 +408,11 @@ static void RefreshSessionList() {
     return;
   }
 
-  // Column header — aligned under Consolas mono font
-  // APP(12) PID(8) PROCS(5) CONNS(6) BRIDGE(6) METHOD(rest)
+  // APP(14) PID(8) PROCS(5) CONNS(6) BRIDGE(6) METHOD
   SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)L"");
   {
     std::wstring hdr =
-      PadCell(L"APP", 12) + L" " +
+      PadCell(L"APP", 14) + L" " +
       PadCell(L"PID", 8, true) + L" " +
       PadCell(L"PROCS", 5, true) + L" " +
       PadCell(L"CONNS", 6, true) + L" " +
@@ -381,12 +420,12 @@ static void RefreshSessionList() {
       L"METHOD";
     SendMessageW(hSessionList, LB_ADDSTRING, 0, (LPARAM)hdr.c_str());
     SendMessageW(hSessionList, LB_ADDSTRING, 0,
-      (LPARAM)L"------------ -------- ----- ------ ------  ----------------");
+      (LPARAM)L"-------------- -------- ----- ------ ------  ----------------");
   }
 
   for (const auto& s : sessions) {
     std::wstring line =
-      PadCell(s.name, 12) + L" " +
+      PadCell(s.name, 14) + L" " +
       PadCell(std::to_wstring(s.pid), 8, true) + L" " +
       PadCell(std::to_wstring(s.processCount > 0 ? s.processCount : 1), 5, true) + L" " +
       PadCell(s.connCount > 0 ? std::to_wstring(s.connCount) : L"-", 6, true) + L" " +
@@ -937,21 +976,36 @@ static void ShowAppRouteHelp(HWND parent) {
   msg += L"App routing\r\n\r\n";
   msg += L"All apps share one local SOCKS bridge on 127.0.0.1 that authenticates\r\n";
   msg += L"to your ProxyPi node. Launch as many apps as you need at the same time.\r\n\r\n";
-  msg += L"Supported:\r\n";
-  msg += L"  Browsers   Chrome, Edge, Brave, Firefox\r\n";
-  msg += L"  Apps       Discord, RuneLite, Jagex Launcher\r\n";
-  msg += L"  Custom     Browse any Chromium / Electron .exe\r\n\r\n";
+  msg += L"Supported apps:\r\n";
+  msg += L"  Browsers  Chrome, Edge, Brave, Firefox, Opera, Vivaldi\r\n";
+  msg += L"  Chat/IDE  Discord, Slack, Teams, VS Code, Cursor\r\n";
+  msg += L"  Other     Postman, Thunderbird, Spotify\r\n";
+  msg += L"  Gaming    RuneLite, Jagex Launcher\r\n";
+  msg += L"  Custom    Browse any Chromium / Electron .exe\r\n\r\n";
   msg += L"Open URL opens a link through a proxied browser.\r\n";
-  msg += L"Copy IP copies your exit IP and session notes for support.\r\n";
+  msg += L"Copy IP copies exit IP + session notes for support.\r\n";
+  msg += L"Last app and URL are remembered on exit.\r\n";
   msg += L"Keep ProxyPiTester open while routed apps are running.\r\n\r\n";
-  msg += L"Detected installs:\r\n";
-  msg += L"  Chrome:  " + (EffectiveChromePath().empty() ? L"(not found)" : EffectiveChromePath()) + L"\r\n";
-  msg += L"  Edge:    " + (FindDefaultEdgePath().empty() ? L"(not found)" : FindDefaultEdgePath()) + L"\r\n";
-  msg += L"  Brave:   " + (FindDefaultBravePath().empty() ? L"(not found)" : FindDefaultBravePath()) + L"\r\n";
-  msg += L"  Firefox: " + (FindDefaultFirefoxPath().empty() ? L"(not found)" : FindDefaultFirefoxPath()) + L"\r\n";
-  msg += L"  Discord: " + (FindDefaultDiscordPath().empty() ? L"(not found)" : FindDefaultDiscordPath()) + L"\r\n";
-  msg += L"  RuneLite:" + (FindDefaultRuneLiteDir().empty() ? L"(not found)" : FindDefaultRuneLiteDir()) + L"\r\n";
-  msg += L"  Jagex:   " + (FindDefaultJagexLauncherPath().empty() ? L"(not found)" : FindDefaultJagexLauncherPath()) + L"\r\n";
+  auto det = [](const std::wstring& label, const std::wstring& p) {
+    return label + (p.empty() ? L"(not found)\r\n" : (p + L"\r\n"));
+  };
+  msg += L"Detected on this PC:\r\n";
+  msg += det(L"  Chrome:      ", EffectiveChromePath());
+  msg += det(L"  Edge:        ", FindDefaultEdgePath());
+  msg += det(L"  Brave:       ", FindDefaultBravePath());
+  msg += det(L"  Firefox:     ", FindDefaultFirefoxPath());
+  msg += det(L"  Discord:     ", FindDefaultDiscordPath());
+  msg += det(L"  Opera:       ", FindDefaultOperaPath());
+  msg += det(L"  Vivaldi:     ", FindDefaultVivaldiPath());
+  msg += det(L"  Slack:       ", FindDefaultSlackPath());
+  msg += det(L"  Teams:       ", FindDefaultTeamsPath());
+  msg += det(L"  VS Code:     ", FindDefaultVSCodePath());
+  msg += det(L"  Cursor:      ", FindDefaultCursorPath());
+  msg += det(L"  Postman:     ", FindDefaultPostmanPath());
+  msg += det(L"  Thunderbird: ", FindDefaultThunderbirdPath());
+  msg += det(L"  Spotify:     ", FindDefaultSpotifyPath());
+  msg += det(L"  RuneLite:    ", FindDefaultRuneLiteDir());
+  msg += det(L"  Jagex:       ", FindDefaultJagexLauncherPath());
   MessageBoxW(parent, msg.c_str(), L"App routing", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -1180,6 +1234,7 @@ static void DoDevLaunchDiscord() {
       L"App routing", MB_ICONWARNING | MB_OK);
     return;
   }
+  if (!ConfirmRelaunchIfRunning(L"Discord", L"Discord.exe")) return;
   SetStatus(L"Starting Discord via proxy bridge...", COL_PRIMARY);
   AppendResult(L"--- Open Discord (proxied) ---");
   std::thread([cfg]() {
@@ -1190,6 +1245,75 @@ static void DoDevLaunchDiscord() {
       ? (L"Discord started (PID " + std::to_wstring(pid) +
          L"). Uses your normal profile + SOCKS bridge.")
       : (L"FAILED - " + err));
+  }).detach();
+}
+
+// Generic one-shot launch helper for new easy apps
+using LaunchFn = bool (*)(const ProxyConfig&, DWORD&, std::wstring&, const std::wstring&);
+// Wrappers with optional path empty
+static bool LaunchOp(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchOperaViaBridge(c, p, e);
+}
+static bool LaunchVi(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchVivaldiViaBridge(c, p, e);
+}
+static bool LaunchSl(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchSlackViaBridge(c, p, e);
+}
+static bool LaunchTm(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchTeamsViaBridge(c, p, e);
+}
+static bool LaunchVs(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchVSCodeViaBridge(c, p, e);
+}
+static bool LaunchCu(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchCursorViaBridge(c, p, e);
+}
+static bool LaunchPo(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchPostmanViaBridge(c, p, e);
+}
+static bool LaunchTb(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchThunderbirdViaBridge(c, p, e);
+}
+static bool LaunchSp(const ProxyConfig& c, DWORD& p, std::wstring& e, const std::wstring&) {
+  return LaunchSpotifyViaBridge(c, p, e);
+}
+
+static void DoLaunchEasyApp(const wchar_t* label,
+                            std::wstring (*findPath)(),
+                            bool (*launch)(const ProxyConfig&, DWORD&, std::wstring&, const std::wstring&),
+                            const wchar_t* imageForGuard,
+                            const wchar_t* notFoundMsg) {
+  ProxyConfig cfg;
+  if (!RequireProxyForRoute(cfg)) return;
+  if (findPath().empty()) {
+    SetStatus(std::wstring(label) + L" not found.", COL_ERROR);
+    MessageBoxW(hMain, notFoundMsg, L"App routing", MB_ICONWARNING | MB_OK);
+    return;
+  }
+  if (imageForGuard && imageForGuard[0] &&
+      !ConfirmRelaunchIfRunning(label, imageForGuard))
+    return;
+  SetStatus(std::wstring(L"Starting ") + label + L"...", COL_PRIMARY);
+  AppendResult(std::wstring(L"--- Open ") + label + L" (proxied) ---");
+  std::wstring name = label;
+  std::thread([cfg, launch, name]() {
+    DWORD pid = 0;
+    std::wstring err;
+    bool ok = launch(cfg, pid, err, L"");
+    std::wstring msg;
+    if (ok) {
+      msg = name + L" started (PID " + std::to_wstring(pid) + L").";
+      if (name == L"Postman") {
+        msg += L" Test: GET https://api.ipify.org — must match Test Proxy IP.";
+        msg += L" If not: Settings > Proxy > use system/env proxy, then restart from here.";
+      } else if (name == L"VS Code" || name == L"Cursor") {
+        msg += L" Uses a ProxyPi profile (settings force SOCKS). Keep extensions via default folder.";
+      }
+    } else {
+      msg = L"FAILED - " + err;
+    }
+    PostRouteResult(ok, msg);
   }).detach();
 }
 
@@ -1271,6 +1395,7 @@ static void DoOpenUrlViaProxy() {
       L"Open URL", MB_OK | MB_ICONINFORMATION);
     return;
   }
+  SaveAppRoutePrefs();
   SetStatus(L"Opening URL via proxied browser...", COL_PRIMARY);
   AppendResult(L"--- Open URL (proxied) ---");
   AppendResult(L"  URL: " + url);
@@ -1347,6 +1472,8 @@ static void DoCopyExitIp() {
 static void DoLaunchSelectedApp() {
   if (!hComboApps) return;
   int sel = (int)SendMessageW(hComboApps, CB_GETCURSEL, 0, 0);
+  g_lastAppSel = sel;
+  SaveAppRoutePrefs();
   // Order must match CB_ADDSTRING list in WM_CREATE
   switch (sel) {
     case 0: DoDevLaunchChrome(); break;
@@ -1354,9 +1481,45 @@ static void DoLaunchSelectedApp() {
     case 2: DoDevLaunchBrave(); break;
     case 3: DoDevLaunchFirefox(); break;
     case 4: DoDevLaunchDiscord(); break;
-    case 5: DoDevLaunchRuneLite(); break;
-    case 6: DoDevLaunchJagex(); break;
-    case 7: DoBrowseAndLaunchApp(); break;
+    case 5:
+      DoLaunchEasyApp(L"Opera", FindDefaultOperaPath, LaunchOp, L"opera.exe",
+        L"Opera was not found. Install Opera or use Browse.");
+      break;
+    case 6:
+      DoLaunchEasyApp(L"Vivaldi", FindDefaultVivaldiPath, LaunchVi, L"vivaldi.exe",
+        L"Vivaldi was not found. Install Vivaldi or use Browse.");
+      break;
+    case 7:
+      DoLaunchEasyApp(L"Slack", FindDefaultSlackPath, LaunchSl, L"slack.exe",
+        L"Slack was not found under %LOCALAPPDATA%\\slack.");
+      break;
+    case 8:
+      DoLaunchEasyApp(L"Teams", FindDefaultTeamsPath, LaunchTm, L"Teams.exe",
+        L"Microsoft Teams was not found.");
+      break;
+    case 9:
+      DoLaunchEasyApp(L"VS Code", FindDefaultVSCodePath, LaunchVs, L"Code.exe",
+        L"VS Code was not found (Code.exe).");
+      break;
+    case 10:
+      DoLaunchEasyApp(L"Cursor", FindDefaultCursorPath, LaunchCu, L"Cursor.exe",
+        L"Cursor was not found.");
+      break;
+    case 11:
+      DoLaunchEasyApp(L"Postman", FindDefaultPostmanPath, LaunchPo, L"Postman.exe",
+        L"Postman was not found under %LOCALAPPDATA%\\Postman.");
+      break;
+    case 12:
+      DoLaunchEasyApp(L"Thunderbird", FindDefaultThunderbirdPath, LaunchTb, L"thunderbird.exe",
+        L"Thunderbird was not found.");
+      break;
+    case 13:
+      DoLaunchEasyApp(L"Spotify", FindDefaultSpotifyPath, LaunchSp, L"Spotify.exe",
+        L"Spotify was not found.\r\nNote: Microsoft Store builds may ignore proxy flags.");
+      break;
+    case 14: DoDevLaunchRuneLite(); break;
+    case 15: DoDevLaunchJagex(); break;
+    case 16: DoBrowseAndLaunchApp(); break;
     default:
       SetStatus(L"Select an app from the dropdown first.", COL_ERROR);
       break;
@@ -1640,7 +1803,7 @@ static void ComputeLayout(int cw, int ch) {
   // Compact app toolbar (dropdown + URL row) — frees height for session list
   const int routeChrome = 118; // title + bridge + app row + URL row
   const int resMinH = 90;
-  const int footerBand = 86;
+  const int footerBand = 96; // status strip + clean footer line
 
   if (g_lay.sideBySide) {
     // Account | Config side by side under header
@@ -1689,8 +1852,8 @@ static void ComputeLayout(int cw, int ch) {
   g_lay.routeBot = flexTop + routeH;
   g_lay.resTop = g_lay.routeBot + gap;
   g_lay.resBot = flexBot;
-  g_lay.statusY = ch - 74;
-  g_lay.footerY = ch - 26;
+  g_lay.statusY = ch - 84;  // status card
+  g_lay.footerY = ch - 22;  // branding line under status (room for 16px font)
 }
 
 static void MoveCtrl(HWND h, int x, int y, int w, int hh) {
@@ -1924,6 +2087,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Brave");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Firefox");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Discord");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Opera");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Vivaldi");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Slack");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Teams");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"VS Code");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Cursor");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Postman");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Thunderbird");
+      SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Spotify");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"RuneLite");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Jagex (+ RuneLite wrap)");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Browse Chromium app...");
@@ -1969,7 +2141,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
       // Defaults / load
       ProxyConfig cfg;
-      // Always load AppRoute chrome path from ini (even if proxy section empty)
       {
         wchar_t chromeBuf[MAX_PATH] = {};
         GetPrivateProfileStringW(L"AppRoute", L"ChromePath", L"", chromeBuf, MAX_PATH, GetIniPath().c_str());
@@ -1979,7 +2150,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WriteConfigToUI(cfg);
         SetStatus(L"Loaded saved settings.", COL_TEXT_DIM);
       } else {
-        // Sensible ProxyPi defaults
         cfg.type = ProxyType::SOCKS5;
         cfg.host = L"";
         cfg.port = 18721;
@@ -1987,6 +2157,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WriteConfigToUI(cfg);
         SetStatus(L"Ready - enter your ProxyPi host, port and credentials.", COL_TEXT_DIM);
       }
+      LoadAppRoutePrefs();
       RefreshChromePathLabel();
       SetLogWindow(hResult);
       SetLogMainWindow(hwnd);
@@ -2044,11 +2215,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       RECT statusBg{ g_lay.cardX, g_lay.statusY, g_lay.cardX + g_lay.cardW, g_lay.statusY + 40 };
       FillRoundRect(mem, statusBg, 10, COL_CARD, COL_BORDER);
 
+      // Footer branding — ASCII only (no fancy dots that mojibake), full client width
       {
-        std::wstring foot = L"No logging  ·  UK residential  ·  Pay as you go  ·  v";
+        std::wstring foot = L"No logging | UK residential | Pay as you go | v";
         foot += APP_VERSION;
-        DrawTextAt(mem, foot.c_str(),
-                   g_lay.cardX, g_lay.footerY, g_lay.cardW, COL_TEXT_DIM, hFontSmall, DT_CENTER);
+        RECT footRc{ 8, g_lay.footerY - 2, client.right - 8, g_lay.footerY + 18 };
+        SelectObject(mem, hFontSmall);
+        SetTextColor(mem, COL_TEXT_DIM);
+        SetBkMode(mem, TRANSPARENT);
+        DrawTextW(mem, foot.c_str(), -1, &footRc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
       }
 
       BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
@@ -2372,6 +2548,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY: {
       KillTimer(hwnd, TIMER_SESSIONS);
+      if (hComboApps)
+        g_lastAppSel = (int)SendMessageW(hComboApps, CB_GETCURSEL, 0, 0);
+      SaveAppRoutePrefs();
       // Remove SOCKS vmArgs we wrote so next RuneLite start is not stuck on a dead port
       std::wstring clearErr;
       ClearRuneLiteSocksWrap(clearErr);

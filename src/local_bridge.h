@@ -49,13 +49,25 @@ void ClearRoutedAppSessions();
 std::wstring FindDefaultChromePath();
 std::wstring FindDefaultEdgePath();
 std::wstring FindDefaultBravePath();
+std::wstring FindDefaultOperaPath();
+std::wstring FindDefaultVivaldiPath();
 std::wstring FindDefaultFirefoxPath();
 std::wstring FindDefaultDiscordPath();
+std::wstring FindDefaultSlackPath();
+std::wstring FindDefaultTeamsPath();
+std::wstring FindDefaultVSCodePath();
+std::wstring FindDefaultCursorPath();
+std::wstring FindDefaultPostmanPath();
+std::wstring FindDefaultThunderbirdPath();
+std::wstring FindDefaultSpotifyPath();
 std::wstring FindDefaultRuneLiteDir();
 std::wstring FindDefaultJagexLauncherPath();
 
 // True if basename looks like Chromium/Electron (chrome, edge, brave, discord, opera, …).
 bool IsChromiumLikeExecutable(const std::wstring& exePath);
+
+// True if any process with this image name is running (e.g. L"Discord.exe").
+bool IsImageRunning(const std::wstring& imageBase);
 
 // ---- Launches (all share the same local auth bridge) ----
 
@@ -82,6 +94,28 @@ bool LaunchBraveViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& e
 // Discord (Electron): real profile, proxy only — keeps your Discord login.
 bool LaunchDiscordViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
                             const std::wstring& discordPath = L"");
+
+// Other Electron / Chromium-family apps (keep real profile unless noted).
+bool LaunchOperaViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path = L"", const std::wstring& startUrl = L"");
+bool LaunchVivaldiViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path = L"", const std::wstring& startUrl = L"");
+bool LaunchSlackViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path = L"");
+bool LaunchTeamsViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path = L"");
+bool LaunchVSCodeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                           const std::wstring& path = L"");
+bool LaunchCursorViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                           const std::wstring& path = L"");
+bool LaunchPostmanViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path = L"");
+// Thunderbird: temp profile with SOCKS prefs (like Firefox).
+bool LaunchThunderbirdViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                                const std::wstring& path = L"");
+// Spotify: Electron-style proxy flag (best-effort; Store builds vary).
+bool LaunchSpotifyViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path = L"");
 
 // Open a URL through a proxied browser (Chrome preferred, then Edge, Brave).
 bool LaunchUrlViaProxiedBrowser(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,

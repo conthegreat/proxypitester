@@ -488,6 +488,14 @@ std::wstring FriendlyNameFromImage(const std::wstring& image) {
   if (_wcsicmp(image.c_str(), L"Discord.exe") == 0) return L"Discord";
   if (_wcsicmp(image.c_str(), L"opera.exe") == 0) return L"Opera";
   if (_wcsicmp(image.c_str(), L"vivaldi.exe") == 0) return L"Vivaldi";
+  if (_wcsicmp(image.c_str(), L"slack.exe") == 0) return L"Slack";
+  if (_wcsicmp(image.c_str(), L"Teams.exe") == 0) return L"Teams";
+  if (_wcsicmp(image.c_str(), L"ms-teams.exe") == 0) return L"Teams";
+  if (_wcsicmp(image.c_str(), L"Code.exe") == 0) return L"VS Code";
+  if (_wcsicmp(image.c_str(), L"Cursor.exe") == 0) return L"Cursor";
+  if (_wcsicmp(image.c_str(), L"Postman.exe") == 0) return L"Postman";
+  if (_wcsicmp(image.c_str(), L"thunderbird.exe") == 0) return L"Thunderbird";
+  if (_wcsicmp(image.c_str(), L"Spotify.exe") == 0) return L"Spotify";
   if (_wcsicmp(image.c_str(), L"RuneLite.exe") == 0) return L"RuneLite";
   if (_wcsicmp(image.c_str(), L"java.exe") == 0) return L"RuneLite";
   if (_wcsicmp(image.c_str(), L"JagexLauncher.exe") == 0) return L"Jagex";
@@ -581,14 +589,67 @@ std::wstring ImageHintForAppName(const std::wstring& name) {
   if (name == L"Chrome") return L"chrome.exe";
   if (name == L"Edge") return L"msedge.exe";
   if (name == L"Brave") return L"brave.exe";
+  if (name == L"Opera") return L"opera.exe";
+  if (name == L"Vivaldi") return L"vivaldi.exe";
   if (name == L"Firefox") return L"firefox.exe";
   if (name == L"Discord") return L"Discord.exe";
+  if (name == L"Slack") return L"slack.exe";
+  if (name == L"Teams") return L"Teams.exe";
+  if (name == L"VS Code") return L"Code.exe";
+  if (name == L"Cursor") return L"Cursor.exe";
+  if (name == L"Postman") return L"Postman.exe";
+  if (name == L"Thunderbird") return L"thunderbird.exe";
+  if (name == L"Spotify") return L"Spotify.exe";
   if (name == L"RuneLite") return L"RuneLite.exe";
   if (name == L"Jagex") return L"JagexLauncher.exe";
   return {};
 }
 
 } // namespace
+
+// Newest app-*\Exe under a root (Discord / Slack / Postman layout).
+static std::wstring FindNewestAppDirExe(const std::wstring& root, const std::wstring& exeName) {
+  if (root.empty() || exeName.empty()) return {};
+  std::wstring best;
+  FILETIME bestWrite{};
+  WIN32_FIND_DATAW fd{};
+  HANDLE h = FindFirstFileW((root + L"\\app-*").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+      std::wstring cand = root + L"\\" + fd.cFileName + L"\\" + exeName;
+      if (GetFileAttributesW(cand.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+      if (best.empty() || CompareFileTime(&fd.ftLastWriteTime, &bestWrite) > 0) {
+        best = cand;
+        bestWrite = fd.ftLastWriteTime;
+      }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  if (!best.empty()) return best;
+  std::wstring fallback = root + L"\\" + exeName;
+  if (GetFileAttributesW(fallback.c_str()) != INVALID_FILE_ATTRIBUTES) return fallback;
+  return {};
+}
+
+bool IsImageRunning(const std::wstring& imageBase) {
+  if (imageBase.empty()) return false;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return false;
+  PROCESSENTRY32W pe{};
+  pe.dwSize = sizeof(pe);
+  bool found = false;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (_wcsicmp(pe.szExeFile, imageBase.c_str()) == 0) {
+        found = true;
+        break;
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  return found;
+}
 
 void RegisterRoutedApp(DWORD pid, const std::wstring& name, const std::wstring& method, int bridgePort) {
   if (pid == 0 && name.empty()) return;
@@ -807,7 +868,8 @@ bool IsChromiumLikeExecutable(const std::wstring& exePath) {
   const wchar_t* names[] = {
     L"chrome.exe", L"msedge.exe", L"brave.exe", L"chromium.exe",
     L"opera.exe", L"vivaldi.exe", L"Discord.exe", L"slack.exe",
-    L"Teams.exe", L"code.exe", L"Cursor.exe"
+    L"Teams.exe", L"ms-teams.exe", L"Code.exe", L"Cursor.exe",
+    L"Postman.exe", L"Spotify.exe"
   };
   for (auto n : names) {
     if (_wcsicmp(b.c_str(), n) == 0) return true;
@@ -820,6 +882,105 @@ bool IsChromiumLikeExecutable(const std::wstring& exePath) {
   if (lower.find(L"\\brave") != std::wstring::npos) return true;
   if (lower.find(L"\\discord") != std::wstring::npos) return true;
   return false;
+}
+
+// Build full Unicode environment block with SOCKS proxy vars injected (for Electron/Node apps).
+// CreateProcessW wants: KEY=VAL\0KEY=VAL\0\0
+static std::vector<wchar_t> BuildEnvWithSocksProxy(int localPort) {
+  std::wstring proxy = L"socks5://127.0.0.1:" + std::to_wstring(localPort);
+  std::wstring noProxy = L"localhost,127.0.0.1,::1";
+
+  // Keys we override (case-sensitive variants used by different tools)
+  const wchar_t* overrideKeys[] = {
+    L"ALL_PROXY", L"all_proxy", L"HTTP_PROXY", L"http_proxy",
+    L"HTTPS_PROXY", L"https_proxy", L"SOCKS_PROXY", L"socks_proxy",
+    L"NO_PROXY", L"no_proxy"
+  };
+
+  std::vector<std::wstring> lines;
+  LPWCH env = GetEnvironmentStringsW();
+  if (env) {
+    for (LPWCH p = env; *p; ) {
+      std::wstring entry = p;
+      p += entry.size() + 1;
+      size_t eq = entry.find(L'=');
+      if (eq == std::wstring::npos) continue;
+      std::wstring key = entry.substr(0, eq);
+      bool skip = false;
+      for (auto ok : overrideKeys) {
+        if (_wcsicmp(key.c_str(), ok) == 0) { skip = true; break; }
+      }
+      if (!skip) lines.push_back(entry);
+    }
+    FreeEnvironmentStringsW(env);
+  }
+
+  lines.push_back(L"ALL_PROXY=" + proxy);
+  lines.push_back(L"all_proxy=" + proxy);
+  lines.push_back(L"HTTP_PROXY=" + proxy);
+  lines.push_back(L"http_proxy=" + proxy);
+  lines.push_back(L"HTTPS_PROXY=" + proxy);
+  lines.push_back(L"https_proxy=" + proxy);
+  lines.push_back(L"SOCKS_PROXY=" + proxy);
+  lines.push_back(L"socks_proxy=" + proxy);
+  lines.push_back(L"NO_PROXY=" + noProxy);
+  lines.push_back(L"no_proxy=" + noProxy);
+
+  std::vector<wchar_t> block;
+  for (const auto& line : lines) {
+    block.insert(block.end(), line.begin(), line.end());
+    block.push_back(L'\0');
+  }
+  block.push_back(L'\0');
+  return block;
+}
+
+static bool EnsureDir(const std::wstring& path) {
+  if (path.empty()) return false;
+  if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+  // create parents
+  for (size_t i = 3; i < path.size(); ++i) {
+    if (path[i] == L'\\' || path[i] == L'/') {
+      std::wstring sub = path.substr(0, i);
+      CreateDirectoryW(sub.c_str(), nullptr);
+    }
+  }
+  return CreateDirectoryW(path.c_str(), nullptr) != 0 ||
+         GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// VS Code / Cursor: dedicated user-data-dir with http.proxy (Electron flag alone is not enough)
+static std::wstring EnsureIdeProxyUserDataDir(const std::wstring& appTag, int localPort) {
+  wchar_t local[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) return {};
+  std::wstring root = local;
+  root += L"\\ProxyPiTester\\Profiles\\";
+  root += appTag;
+  std::wstring userDir = root + L"\\User";
+  if (!EnsureDir(userDir)) return {};
+
+  std::wstring settingsPath = userDir + L"\\settings.json";
+  std::string json;
+  json += "{\n";
+  json += "  \"http.proxy\": \"socks5://127.0.0.1:" + std::to_string(localPort) + "\",\n";
+  json += "  \"http.proxySupport\": \"override\",\n";
+  json += "  \"http.proxyStrictSSL\": true,\n";
+  json += "  \"http.systemCertificates\": true\n";
+  json += "}\n";
+
+  HANDLE hF = CreateFileW(settingsPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hF == INVALID_HANDLE_VALUE) return {};
+  DWORD wr = 0;
+  WriteFile(hF, json.c_str(), (DWORD)json.size(), &wr, nullptr);
+  CloseHandle(hF);
+  return root;
+}
+
+static std::wstring DefaultVscodeExtensionsDir() {
+  wchar_t home[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"USERPROFILE", home, MAX_PATH)) return {};
+  return std::wstring(home) + L"\\.vscode\\extensions";
 }
 
 bool LaunchChromiumLikeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
@@ -849,6 +1010,10 @@ bool LaunchChromiumLikeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wst
   std::wstring proxyFlag = L"socks5://127.0.0.1:" + std::to_wstring(localPort);
   std::wstring cmdLine = L"\"" + exePath + L"\"";
 
+  const bool isIde = (_wcsicmp(displayName.c_str(), L"VS Code") == 0 ||
+                      _wcsicmp(displayName.c_str(), L"Cursor") == 0);
+  const bool isElectronApp = !useTempProfile; // Discord, Postman, Slack, Teams, Spotify, IDEs
+
   if (useTempProfile) {
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
@@ -861,10 +1026,26 @@ bool LaunchChromiumLikeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wst
     cmdLine += L" --user-data-dir=\"" + prof + L"\"";
     cmdLine += L" --no-first-run --no-default-browser-check";
     cmdLine += L" --disable-features=DnsOverHttps";
+  } else if (isIde) {
+    // Force VS Code / Cursor proxy via settings.json (Chromium switch alone is ignored)
+    std::wstring tag = (_wcsicmp(displayName.c_str(), L"Cursor") == 0) ? L"Cursor" : L"VSCode";
+    std::wstring udd = EnsureIdeProxyUserDataDir(tag, localPort);
+    if (!udd.empty()) {
+      cmdLine += L" --user-data-dir=\"" + udd + L"\"";
+      std::wstring ext = DefaultVscodeExtensionsDir();
+      if (!ext.empty() && GetFileAttributesW(ext.c_str()) != INVALID_FILE_ATTRIBUTES)
+        cmdLine += L" --extensions-dir=\"" + ext + L"\"";
+    }
   }
 
-  cmdLine += L" --proxy-server=\"" + proxyFlag + L"\"";
+  // Chromium network switch (browsers + some Electron). Electron/Node also need env vars below.
+  cmdLine += L" --proxy-server=" + proxyFlag;
+  cmdLine += L" --proxy-bypass-list=<-loopback>";
   cmdLine += L" --disable-quic";
+  // DNS through proxy for browsers only (can break Electron local IPC if applied broadly)
+  if (useTempProfile) {
+    cmdLine += L" --host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1, EXCLUDE localhost\"";
+  }
 
   if (!startUrl.empty()) {
     if (useTempProfile)
@@ -885,9 +1066,18 @@ bool LaunchChromiumLikeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wst
   std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
   cmdBuf.push_back(L'\0');
 
+  // Electron / Node apps (Postman, Discord, VS Code) need env proxy vars — CLI alone is not enough
+  std::vector<wchar_t> envBlock;
+  LPVOID envPtr = nullptr;
+  DWORD createFlags = CREATE_UNICODE_ENVIRONMENT;
+  if (isElectronApp || isIde) {
+    envBlock = BuildEnvWithSocksProxy(localPort);
+    envPtr = envBlock.data();
+  }
+
   BOOL ok = CreateProcessW(
     nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
-    CREATE_UNICODE_ENVIRONMENT, nullptr,
+    createFlags, envPtr,
     workDir.empty() ? nullptr : workDir.c_str(),
     &si, &pi);
 
@@ -900,10 +1090,11 @@ bool LaunchChromiumLikeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wst
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
 
-  std::wstring method = useTempProfile ? L"chromium" : L"electron";
+  std::wstring method = useTempProfile ? L"chromium" : (isIde ? L"ide-proxy-settings" : L"electron+env");
   RegisterRoutedApp(outPid, displayName, method, localPort);
   OutputDebugStringW((L"[dev] " + displayName + L" via bridge 127.0.0.1:" +
-                      std::to_wstring(localPort) + L" PID=" + std::to_wstring(outPid) + L"\r\n").c_str());
+                      std::to_wstring(localPort) + L" PID=" + std::to_wstring(outPid) +
+                      L" method=" + method + L"\r\n").c_str());
   return true;
 }
 
@@ -994,6 +1185,228 @@ bool LaunchDiscordViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring&
   }
   // Keep real profile so user stays logged in
   return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Discord", false, L"");
+}
+
+std::wstring FindDefaultOperaPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Programs\\Opera\\opera.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  const wchar_t* c[] = {
+    L"C:\\Program Files\\Opera\\opera.exe",
+    L"C:\\Program Files (x86)\\Opera\\opera.exe",
+  };
+  for (auto x : c) if (GetFileAttributesW(x) != INVALID_FILE_ATTRIBUTES) return x;
+  return {};
+}
+
+std::wstring FindDefaultVivaldiPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Vivaldi\\Application\\vivaldi.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  const wchar_t* c[] = {
+    L"C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe",
+  };
+  for (auto x : c) if (GetFileAttributesW(x) != INVALID_FILE_ATTRIBUTES) return x;
+  return {};
+}
+
+std::wstring FindDefaultSlackPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) return {};
+  return FindNewestAppDirExe(std::wstring(buf) + L"\\slack", L"slack.exe");
+}
+
+std::wstring FindDefaultTeamsPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Microsoft\\Teams\\current\\Teams.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    p = std::wstring(buf) + L"\\Microsoft\\WindowsApps\\ms-teams.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  return {};
+}
+
+std::wstring FindDefaultVSCodePath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Programs\\Microsoft VS Code\\Code.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  const wchar_t* c[] = {
+    L"C:\\Program Files\\Microsoft VS Code\\Code.exe",
+    L"C:\\Program Files (x86)\\Microsoft VS Code\\Code.exe",
+  };
+  for (auto x : c) if (GetFileAttributesW(x) != INVALID_FILE_ATTRIBUTES) return x;
+  return {};
+}
+
+std::wstring FindDefaultCursorPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Programs\\cursor\\Cursor.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+    p = std::wstring(buf) + L"\\Programs\\Cursor\\Cursor.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  return {};
+}
+
+std::wstring FindDefaultPostmanPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) return {};
+  return FindNewestAppDirExe(std::wstring(buf) + L"\\Postman", L"Postman.exe");
+}
+
+std::wstring FindDefaultThunderbirdPath() {
+  const wchar_t* c[] = {
+    L"C:\\Program Files\\Mozilla Thunderbird\\thunderbird.exe",
+    L"C:\\Program Files (x86)\\Mozilla Thunderbird\\thunderbird.exe",
+  };
+  for (auto x : c) if (GetFileAttributesW(x) != INVALID_FILE_ATTRIBUTES) return x;
+  return {};
+}
+
+std::wstring FindDefaultSpotifyPath() {
+  wchar_t buf[MAX_PATH] = {};
+  if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Spotify\\Spotify.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+    std::wstring p = std::wstring(buf) + L"\\Microsoft\\WindowsApps\\Spotify.exe";
+    if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+  }
+  return {};
+}
+
+bool LaunchOperaViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path, const std::wstring& startUrl) {
+  std::wstring exe = path.empty() ? FindDefaultOperaPath() : path;
+  if (exe.empty()) { err = L"Opera not found (opera.exe)."; return false; }
+  std::wstring url = startUrl.empty() ? L"http://ifconfig.me" : startUrl;
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Opera", true, url);
+}
+
+bool LaunchVivaldiViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path, const std::wstring& startUrl) {
+  std::wstring exe = path.empty() ? FindDefaultVivaldiPath() : path;
+  if (exe.empty()) { err = L"Vivaldi not found (vivaldi.exe)."; return false; }
+  std::wstring url = startUrl.empty() ? L"http://ifconfig.me" : startUrl;
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Vivaldi", true, url);
+}
+
+bool LaunchSlackViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultSlackPath() : path;
+  if (exe.empty()) { err = L"Slack not found under %LOCALAPPDATA%\\slack."; return false; }
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Slack", false, L"");
+}
+
+bool LaunchTeamsViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                          const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultTeamsPath() : path;
+  if (exe.empty()) { err = L"Microsoft Teams not found."; return false; }
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Teams", false, L"");
+}
+
+bool LaunchVSCodeViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                           const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultVSCodePath() : path;
+  if (exe.empty()) { err = L"VS Code not found (Code.exe)."; return false; }
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"VS Code", false, L"");
+}
+
+bool LaunchCursorViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                           const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultCursorPath() : path;
+  if (exe.empty()) { err = L"Cursor not found (Cursor.exe)."; return false; }
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Cursor", false, L"");
+}
+
+bool LaunchPostmanViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultPostmanPath() : path;
+  if (exe.empty()) { err = L"Postman not found under %LOCALAPPDATA%\\Postman."; return false; }
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Postman", false, L"");
+}
+
+bool LaunchSpotifyViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                            const std::wstring& path) {
+  std::wstring exe = path.empty() ? FindDefaultSpotifyPath() : path;
+  if (exe.empty()) { err = L"Spotify not found."; return false; }
+  // Best-effort Electron-style; Store stubs may ignore proxy flags
+  return LaunchChromiumLikeViaBridge(cfg, outPid, err, exe, L"Spotify", false, L"");
+}
+
+bool LaunchThunderbirdViaBridge(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,
+                                const std::wstring& path) {
+  outPid = 0;
+  err.clear();
+  if (cfg.host.empty() || cfg.port <= 0) {
+    err = L"Proxy host/port not configured";
+    return false;
+  }
+  int localPort = 0;
+  if (!EnsureLocalAuthBridge(cfg, localPort, err) || localPort <= 0) {
+    if (err.empty()) err = L"Failed to start local auth bridge";
+    return false;
+  }
+  std::wstring exe = path.empty() ? FindDefaultThunderbirdPath() : path;
+  if (exe.empty() || GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    err = L"Thunderbird not found (thunderbird.exe).";
+    return false;
+  }
+  wchar_t temp[MAX_PATH];
+  GetTempPathW(MAX_PATH, temp);
+  std::wstring prof = temp;
+  prof += L"ProxyPiTester_TB_";
+  prof += std::to_wstring(GetTickCount64());
+  CreateDirectoryW(prof.c_str(), nullptr);
+
+  std::string prefs;
+  prefs += "user_pref(\"network.proxy.type\", 1);\r\n";
+  prefs += "user_pref(\"network.proxy.socks\", \"127.0.0.1\");\r\n";
+  prefs += "user_pref(\"network.proxy.socks_port\", " + std::to_string(localPort) + ");\r\n";
+  prefs += "user_pref(\"network.proxy.socks_version\", 5);\r\n";
+  prefs += "user_pref(\"network.proxy.socks_remote_dns\", true);\r\n";
+  prefs += "user_pref(\"network.proxy.no_proxies_on\", \"localhost, 127.0.0.1\");\r\n";
+
+  auto writeText = [&](const std::wstring& p, const std::string& body) {
+    HANDLE hF = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hF == INVALID_HANDLE_VALUE) return false;
+    DWORD wr = 0;
+    BOOL ok = WriteFile(hF, body.c_str(), (DWORD)body.size(), &wr, nullptr);
+    CloseHandle(hF);
+    return ok != FALSE;
+  };
+  if (!writeText(prof + L"\\user.js", "// ProxyPiTester SOCKS\r\n" + prefs)) {
+    err = L"Failed to write Thunderbird user.js";
+    return false;
+  }
+  writeText(prof + L"\\prefs.js", prefs);
+
+  std::wstring cmdLine = L"\"" + exe + L"\" -profile \"" + prof + L"\" -no-remote";
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+  cmdBuf.push_back(L'\0');
+  if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                      CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &si, &pi)) {
+    err = L"CreateProcess failed for Thunderbird. Error=" + std::to_wstring(GetLastError());
+    return false;
+  }
+  outPid = pi.dwProcessId;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  RegisterRoutedApp(outPid, L"Thunderbird", L"thunderbird-profile", localPort);
+  return true;
 }
 
 bool LaunchUrlViaProxiedBrowser(const ProxyConfig& cfg, DWORD& outPid, std::wstring& err,

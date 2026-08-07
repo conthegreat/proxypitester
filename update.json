@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
-  "download_url": "https://github.com/conthegreat/proxypitester/releases/download/v1.2.0/ProxyPiTester-v1.2.0-win64.zip",
-  "notes": "App routing: Chrome, Edge, Brave, Firefox, Discord, RuneLite, Jagex. Multi-app shared SOCKS bridge, live Active Apps panel, Open URL via proxy, Copy exit IP. Login & Load My Proxy, connectivity + speed tests."
+  "version": "1.2.1",
+  "download_url": "https://github.com/conthegreat/proxypitester/releases/download/v1.2.1/ProxyPiTester-v1.2.1-win64.zip",
+  "notes": "Electron proxy fix: Postman + VS Code/Cursor now force SOCKS via env + IDE settings. Easy apps: Opera, Vivaldi, Slack, Teams, VS Code, Cursor, Postman, Thunderbird, Spotify. Bridge health + exit IP in Active Apps. Remember last app/URL."
 }
