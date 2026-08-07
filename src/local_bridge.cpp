@@ -29,8 +29,11 @@ std::atomic<bool> g_stop{false};
 SOCKET g_listenSock = INVALID_SOCKET;
 int g_localPort = 0;
 ProxyConfig g_cfg;
+ProxyConfig g_lastBridgeCfg; // copy for auto-restart
+bool g_haveLastBridgeCfg = false;
 std::thread g_acceptThread;
 std::wstring g_lastErr;
+std::atomic<bool> g_runeLiteWrapDesired{false};
 
 void CloseSock(SOCKET& s) {
   if (s != INVALID_SOCKET) {
@@ -353,6 +356,8 @@ bool EnsureLocalAuthBridge(const ProxyConfig& cfg, int& outLocalPort, std::wstri
     // Already running: just refresh upstream config (per-connection copy) and reuse port
     if (g_running && g_listenSock != INVALID_SOCKET && g_localPort > 0) {
       g_cfg = cfg;
+      g_lastBridgeCfg = cfg;
+      g_haveLastBridgeCfg = true;
       outLocalPort = g_localPort;
       portForLog = g_localPort;
       reused = true;
@@ -362,6 +367,8 @@ bool EnsureLocalAuthBridge(const ProxyConfig& cfg, int& outLocalPort, std::wstri
     } else {
       g_stop = false;
       g_cfg = cfg;
+      g_lastBridgeCfg = cfg;
+      g_haveLastBridgeCfg = true;
 
       SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
       if (ls == INVALID_SOCKET) {
@@ -433,6 +440,54 @@ bool IsLocalAuthBridgeRunning() {
 
 int GetLocalAuthBridgePort() {
   return (g_running.load() && g_localPort > 0) ? g_localPort : 0;
+}
+
+bool GetLastBridgeConfig(ProxyConfig& out) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!g_haveLastBridgeCfg || g_lastBridgeCfg.host.empty()) return false;
+  out = g_lastBridgeCfg;
+  return true;
+}
+
+bool EnsureBridgeAlive(std::wstring& err) {
+  err.clear();
+  if (IsLocalAuthBridgeRunning()) return true;
+  ProxyConfig cfg;
+  if (!GetLastBridgeConfig(cfg)) {
+    err = L"No previous bridge config to restart";
+    return false;
+  }
+  int port = 0;
+  return EnsureLocalAuthBridge(cfg, port, err) && port > 0;
+}
+
+int TerminateProcessesByImage(const std::wstring& imageBase, DWORD waitMs) {
+  if (imageBase.empty()) return 0;
+  std::vector<HANDLE> handles;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return 0;
+  PROCESSENTRY32W pe{};
+  pe.dwSize = sizeof(pe);
+  int count = 0;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (_wcsicmp(pe.szExeFile, imageBase.c_str()) != 0) continue;
+      HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+      if (!h) continue;
+      if (TerminateProcess(h, 1)) {
+        ++count;
+        handles.push_back(h);
+      } else {
+        CloseHandle(h);
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  if (!handles.empty() && waitMs > 0) {
+    WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, waitMs);
+  }
+  for (HANDLE h : handles) CloseHandle(h);
+  return count;
 }
 
 // ---- Multi-app session registry ----
@@ -805,6 +860,56 @@ std::vector<RoutedAppSession> GetRoutedAppSessions() {
 void ClearRoutedAppSessions() {
   std::lock_guard<std::mutex> lock(g_sessMu);
   g_sessions.clear();
+}
+
+int TerminateRoutedApp(const std::wstring& appName) {
+  if (appName.empty()) return 0;
+  std::vector<std::wstring> images;
+  if (appName == L"Chrome") images = { L"chrome.exe" };
+  else if (appName == L"Edge") images = { L"msedge.exe" };
+  else if (appName == L"Brave") images = { L"brave.exe" };
+  else if (appName == L"Opera") images = { L"opera.exe" };
+  else if (appName == L"Vivaldi") images = { L"vivaldi.exe" };
+  else if (appName == L"Firefox") images = { L"firefox.exe" };
+  else if (appName == L"Discord") images = { L"Discord.exe" };
+  else if (appName == L"Slack") images = { L"slack.exe" };
+  else if (appName == L"Teams") images = { L"Teams.exe", L"ms-teams.exe" };
+  else if (appName == L"VS Code") images = { L"Code.exe" };
+  else if (appName == L"Cursor") images = { L"Cursor.exe" };
+  else if (appName == L"Postman") images = { L"Postman.exe" };
+  else if (appName == L"Thunderbird") images = { L"thunderbird.exe" };
+  else if (appName == L"Spotify") images = { L"Spotify.exe" };
+  else if (appName == L"RuneLite") images = { L"RuneLite.exe" };
+  else if (appName == L"Jagex") images = { L"JagexLauncher.exe" };
+  else images.push_back(appName + L".exe");
+
+  int total = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_sessMu);
+    for (const auto& s : g_sessions) {
+      if (_wcsicmp(s.name.c_str(), appName.c_str()) != 0) continue;
+      if (!s.pid) continue;
+      HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, s.pid);
+      if (h) {
+        if (TerminateProcess(h, 1)) ++total;
+        WaitForSingleObject(h, 2000);
+        CloseHandle(h);
+      }
+    }
+  }
+  for (const auto& img : images)
+    total += TerminateProcessesByImage(img, 4000);
+
+  {
+    std::lock_guard<std::mutex> lock(g_sessMu);
+    std::vector<RoutedAppSession> keep;
+    for (const auto& s : g_sessions) {
+      if (_wcsicmp(s.name.c_str(), appName.c_str()) != 0)
+        keep.push_back(s);
+    }
+    g_sessions.swap(keep);
+  }
+  return total;
 }
 
 std::wstring FindDefaultChromePath() {
@@ -1853,7 +1958,6 @@ bool ApplyRuneLiteSocksWrap(int localSocksPort, std::wstring& err) {
     return false;
   }
 
-  // Backup once
   std::wstring bak = path + L".proxypi.bak";
   if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES) {
     CopyFileW(path.c_str(), bak.c_str(), TRUE);
@@ -1865,6 +1969,7 @@ bool ApplyRuneLiteSocksWrap(int localSocksPort, std::wstring& err) {
   if (!InsertSocksVmArgs(json, localSocksPort, err)) return false;
   if (!WriteFileUtf8(path, json, err)) return false;
 
+  g_runeLiteWrapDesired = true;
   OutputDebugStringW((L"[dev] RuneLite SOCKS wrap applied port=" +
                       std::to_wstring(localSocksPort) + L"\r\n").c_str());
   return true;
@@ -1872,9 +1977,9 @@ bool ApplyRuneLiteSocksWrap(int localSocksPort, std::wstring& err) {
 
 bool ClearRuneLiteSocksWrap(std::wstring& err) {
   err.clear();
+  g_runeLiteWrapDesired = false;
   std::wstring path = RuneLiteConfigPath();
   if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    // Nothing to clear
     return true;
   }
   std::string json;
@@ -1884,10 +1989,6 @@ bool ClearRuneLiteSocksWrap(std::wstring& err) {
     return true;
   }
   json = StripSocksVmArgs(json);
-  // Fix possible trailing comma before ] after last entry removal (rare)
-  // e.g. last real entry ends with , then ] - JSON allows trailing commas? No.
-  // If we removed the last entry, previous entry still has comma - OK in JSON arrays
-  // If we removed middle entries we're fine. If only socks entries existed - unlikely.
   if (!WriteFileUtf8(path, json, err)) return false;
   OutputDebugStringW(L"[dev] RuneLite SOCKS wrap cleared\r\n");
   return true;
@@ -1910,6 +2011,35 @@ int GetRuneLiteSocksWrapPort() {
   std::wstring err;
   if (!ReadFileUtf8(path, json, err)) return 0;
   return ParseSocksPortFromConfig(json);
+}
+
+void SetRuneLiteWrapDesired(bool desired) {
+  g_runeLiteWrapDesired = desired;
+}
+
+bool IsRuneLiteWrapDesired() {
+  return g_runeLiteWrapDesired.load();
+}
+
+bool ReArmRuneLiteWrapIfNeeded(std::wstring& err) {
+  err.clear();
+  if (!g_runeLiteWrapDesired.load()) return true;
+  if (IsRuneLiteSocksWrapActive()) {
+    // Port may be stale if bridge restarted — refresh if port mismatch
+    int want = GetLocalAuthBridgePort();
+    int have = GetRuneLiteSocksWrapPort();
+    if (want <= 0 || want == have) return true;
+  }
+  int port = GetLocalAuthBridgePort();
+  if (port <= 0) {
+    if (!EnsureBridgeAlive(err)) return false;
+    port = GetLocalAuthBridgePort();
+  }
+  if (port <= 0) {
+    err = L"No bridge port for RuneLite wrap re-arm";
+    return false;
+  }
+  return ApplyRuneLiteSocksWrap(port, err);
 }
 
 bool LaunchJagexWithRuneLiteWrap(const ProxyConfig& cfg, DWORD& outPid, int& outBridgePort,

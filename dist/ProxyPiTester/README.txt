@@ -1,4 +1,4 @@
-ProxyPiTester v1.2.2
+ProxyPiTester v1.3.0
 ====================
 
 UK residential proxy test & app routing for ProxyPi.
@@ -7,7 +7,7 @@ https://proxypi.co.uk
 Quick start
 -----------
 1. Double-click ProxyPiTester.exe
-2. Log in with your ProxyPi account
+2. Log in with your ProxyPi account (optional: Remember me)
 3. Login and Load My Proxy
 4. Test Proxy / Speed Test
 5. Open apps from Active Apps (keep this app open while routing)
@@ -25,5 +25,6 @@ Tips
 - Fully quit Electron apps before launching from here (tray too)
 - Postman/VS Code use SOCKS env + IDE proxy settings
 - First latency test is often slower (DNS + cold path)
+- Resize freely — the window scrolls instead of squashing the layout
 
 Support: support@proxypi.co.uk

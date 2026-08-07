@@ -27,6 +27,18 @@ bool IsLocalAuthBridgeRunning();
 // Current bridge listen port, or 0 if not running.
 int GetLocalAuthBridgePort();
 
+// Last config passed to EnsureLocalAuthBridge (for auto-restart if bridge dies).
+bool GetLastBridgeConfig(ProxyConfig& out);
+
+// If bridge was running/configured and died, restart with last config. Returns true if (re)running.
+bool EnsureBridgeAlive(std::wstring& err);
+
+// Kill all processes with this image name (e.g. L"Postman.exe"). Returns count terminated.
+int TerminateProcessesByImage(const std::wstring& imageBase, DWORD waitMs = 4000);
+
+// Kill processes for a routed app name (uses image mapping + registered PIDs).
+int TerminateRoutedApp(const std::wstring& appName);
+
 // ---- Routed app sessions (multi-app monitor) ----
 struct RoutedAppSession {
   DWORD pid = 0;           // primary PID (launch PID or first bridge client)
@@ -138,6 +150,11 @@ bool ApplyRuneLiteSocksWrap(int localSocksPort, std::wstring& err);
 bool ClearRuneLiteSocksWrap(std::wstring& err);
 bool IsRuneLiteSocksWrapActive();
 int  GetRuneLiteSocksWrapPort();
+// Desired wrap state (re-apply if RuneLite updater wipes config.json).
+void SetRuneLiteWrapDesired(bool desired);
+bool IsRuneLiteWrapDesired();
+// If wrap is desired but missing from config, re-apply using current bridge port.
+bool ReArmRuneLiteWrapIfNeeded(std::wstring& err);
 
 // Bridge + arm RuneLite wrap + launch Jagex.
 bool LaunchJagexWithRuneLiteWrap(const ProxyConfig& cfg, DWORD& outPid, int& outBridgePort,

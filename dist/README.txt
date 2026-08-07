@@ -1,4 +1,4 @@
-ProxyPiTester v1.2.2
+ProxyPiTester v1.3.0
 
 Download: https://github.com/conthegreat/proxypitester/releases/latest
 Website:  https://proxypi.co.uk

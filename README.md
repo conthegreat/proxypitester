@@ -3,7 +3,7 @@
 Windows desktop tool for [ProxyPi](https://proxypi.co.uk) — **UK residential SOCKS5 / HTTP** proxy testing and **app routing**.
 
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)
-![Version](https://img.shields.io/badge/version-1.2.2-00bcd4)
+![Version](https://img.shields.io/badge/version-1.3.0-00bcd4)
 
 ## Download
 
@@ -14,6 +14,7 @@ Zip contains `ProxyPiTester.exe` only (no credentials).
 ## Features
 
 - **Login & Load My Proxy** via your ProxyPi account (fills host, ports, credentials)
+- **Remember me** — optionally save account email/password locally
 - SOCKS5 / HTTP connectivity test (exit IP + latency)
 - Download speed test through your proxy
 - **App routing** through a shared local SOCKS bridge (auth handled for you):
@@ -22,8 +23,10 @@ Zip contains `ProxyPiTester.exe` only (no credentials).
   - RuneLite, Jagex Launcher
   - Browse any Chromium / Electron `.exe`
 - Live **Active Apps** panel (PID, connections, bridge port)
+- Launch profiles + minimize to tray
 - Open a URL via a proxied browser
 - Copy exit IP + session notes (for support)
+- Resizable UI with vertical scroll (comfortable layout at any size)
 - Save / reload settings locally (`ProxyPiTester.ini` on your PC only)
 - Help: About, Website, Check for Updates
 
