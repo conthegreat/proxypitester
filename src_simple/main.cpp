@@ -27,7 +27,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.2.1";
+static const wchar_t* APP_VERSION = L"1.2.2";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -37,6 +37,47 @@ static const wchar_t* GITHUB_API_HOST = L"api.github.com";
 static const wchar_t* GITHUB_API_PATH = L"/repos/conthegreat/proxypitester/releases/latest";
 static const wchar_t* DEFAULT_DOWNLOAD_URL = L"https://github.com/conthegreat/proxypitester/releases/latest";
 static const wchar_t* WEBSITE_URL = L"https://proxypi.co.uk";
+
+// Open a URL in the default browser. Direct .zip links are unreliable with ShellExecute;
+// fall back to the releases page. Returns true if ShellExecute reported success.
+static bool OpenUrlInDefaultBrowser(HWND hwnd, const std::wstring& urlIn) {
+  std::wstring url = urlIn;
+  while (!url.empty() && (url.back() == L' ' || url.back() == L'\t' || url.back() == L'\r' || url.back() == L'\n'))
+    url.pop_back();
+  if (url.empty()) url = DEFAULT_DOWNLOAD_URL;
+
+  // Prefer a browsable release page over a raw asset URL (ShellExecute often
+  // fails silently or mis-handles direct .zip download links).
+  std::wstring try1 = url;
+  std::wstring try2 = DEFAULT_DOWNLOAD_URL;
+  bool looksLikeAsset = (url.find(L"/download/") != std::wstring::npos);
+  if (!looksLikeAsset && url.size() > 4) {
+    looksLikeAsset = (_wcsicmp(url.c_str() + (url.size() - 4), L".zip") == 0);
+  }
+  if (looksLikeAsset) {
+    try1 = DEFAULT_DOWNLOAD_URL;
+    try2 = url;
+  }
+
+  auto tryOpen = [&](const std::wstring& u) -> bool {
+    if (u.empty()) return false;
+    // ShellExecute returns value > 32 on success
+    INT_PTR rc = (INT_PTR)ShellExecuteW(hwnd, L"open", u.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (rc > 32) return true;
+    // Fallback: cmd start (handles more association edge cases)
+    std::wstring params = L"/c start \"\" \"";
+    params += u;
+    params += L"\"";
+    rc = (INT_PTR)ShellExecuteW(hwnd, L"open", L"cmd.exe", params.c_str(), nullptr, SW_HIDE);
+    return rc > 32;
+  };
+
+  if (tryOpen(try1)) return true;
+  if (try1 != try2 && tryOpen(try2)) return true;
+  if (try1 != DEFAULT_DOWNLOAD_URL && try2 != DEFAULT_DOWNLOAD_URL && tryOpen(DEFAULT_DOWNLOAD_URL))
+    return true;
+  return false;
+}
 // Production website JSON API (proxies to internal RADIUS API)
 static const wchar_t* DESKTOP_API_HOST = L"proxypi.co.uk";
 static const wchar_t* DESKTOP_LOGIN_PATH = L"/api/desktop/login";
@@ -2516,7 +2557,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           }
           msg += L"Open the download page now?";
           if (MessageBoxW(hwnd, msg.c_str(), L"Update Available", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
-            ShellExecuteW(hwnd, L"open", r->downloadUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            std::wstring openUrl = r->downloadUrl.empty() ? DEFAULT_DOWNLOAD_URL : r->downloadUrl;
+            AppendResult(L"Opening download page...");
+            AppendResult(L"  " + openUrl);
+            if (!OpenUrlInDefaultBrowser(hwnd, openUrl)) {
+              SetStatus(L"Could not open browser - copy the URL from Results.", COL_ERROR);
+              AppendResult(L"FAILED - could not open browser. Copy the URL above and paste it into Chrome/Edge.");
+              MessageBoxW(hwnd,
+                (L"Could not open the browser automatically.\r\n\r\n"
+                 L"Copy this URL and open it manually:\r\n\r\n" + openUrl).c_str(),
+                L"Check for Updates", MB_OK | MB_ICONWARNING);
+            } else {
+              SetStatus(L"Opened download page in your browser.", COL_SUCCESS);
+            }
           }
         } else {
           if (!r->silent) {

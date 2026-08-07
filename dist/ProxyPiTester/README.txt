@@ -1,4 +1,4 @@
-ProxyPiTester v1.2.1
+ProxyPiTester v1.2.2
 ====================
 
 UK residential proxy test & app routing for ProxyPi.

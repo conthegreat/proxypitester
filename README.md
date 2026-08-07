@@ -3,7 +3,7 @@
 Windows desktop tool for [ProxyPi](https://proxypi.co.uk) — **UK residential SOCKS5 / HTTP** proxy testing and **app routing**.
 
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)
-![Version](https://img.shields.io/badge/version-1.2.1-00bcd4)
+![Version](https://img.shields.io/badge/version-1.2.2-00bcd4)
 
 ## Download
 
