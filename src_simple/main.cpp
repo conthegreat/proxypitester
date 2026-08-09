@@ -18,6 +18,7 @@
 #include <cctype>
 
 #include <uxtheme.h>
+#include <dbghelp.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -26,11 +27,12 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dbghelp.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.3.1";
+static const wchar_t* APP_VERSION = L"1.3.2";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -212,7 +214,8 @@ static HWND hCheckTray = nullptr;
 static std::wstring g_chromePath; // empty = auto-detect
 static std::wstring g_customAppPath; // last browsed Chromium-like exe
 static int g_lastAppSel = 0;         // combo index remembered in ini
-static bool g_minimizeToTray = true;
+// Default OFF — minimize-to-tray made the app look "crashed" for many users
+static bool g_minimizeToTray = false;
 static bool g_trayAdded = false;
 static NOTIFYICONDATAW g_nid{};
 static UINT g_dpi = 96;
@@ -487,7 +490,15 @@ static bool ConfirmRelaunchIfRunning(const wchar_t* appName, const wchar_t* imag
 static void LoadAppRoutePrefs() {
   std::wstring path = GetIniPath();
   g_lastAppSel = GetPrivateProfileIntW(L"AppRoute", L"LastAppSel", 0, path.c_str());
-  g_minimizeToTray = GetPrivateProfileIntW(L"AppRoute", L"MinimizeToTray", 1, path.c_str()) != 0;
+  // TrayPrefV < 2: force tray OFF once (old default hid the window and looked like a crash)
+  int trayPrefV = GetPrivateProfileIntW(L"AppRoute", L"TrayPrefV", 0, path.c_str());
+  if (trayPrefV < 2) {
+    g_minimizeToTray = false;
+    WritePrivateProfileStringW(L"AppRoute", L"MinimizeToTray", L"0", path.c_str());
+    WritePrivateProfileStringW(L"AppRoute", L"TrayPrefV", L"2", path.c_str());
+  } else {
+    g_minimizeToTray = GetPrivateProfileIntW(L"AppRoute", L"MinimizeToTray", 0, path.c_str()) != 0;
+  }
   wchar_t url[1024] = {}, custom[MAX_PATH] = {};
   GetPrivateProfileStringW(L"AppRoute", L"LastUrl", L"https://ifconfig.me", url, 1024, path.c_str());
   GetPrivateProfileStringW(L"AppRoute", L"CustomApp", L"", custom, MAX_PATH, path.c_str());
@@ -679,23 +690,43 @@ static void TrayRemove() {
   g_trayAdded = false;
 }
 
-static void TrayAdd(HWND hwnd) {
-  if (g_trayAdded) return;
+static void TrayAdd(HWND hwnd, bool balloon = true) {
+  if (g_trayAdded) {
+    if (balloon) {
+      g_nid.uFlags = NIF_INFO | NIF_TIP | NIF_ICON | NIF_MESSAGE;
+      g_nid.dwInfoFlags = NIIF_INFO;
+      wcsncpy_s(g_nid.szInfoTitle, L"ProxyPiTester is still running", _TRUNCATE);
+      wcsncpy_s(g_nid.szInfo,
+                L"Minimized to the system tray (near the clock). Click the icon to restore.",
+                _TRUNCATE);
+      Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+    return;
+  }
   ZeroMemory(&g_nid, sizeof(g_nid));
   g_nid.cbSize = sizeof(g_nid);
   g_nid.hWnd = hwnd;
   g_nid.uID = TRAY_ICON_ID;
-  g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+  g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | (balloon ? NIF_INFO : 0);
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
   if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-  wcsncpy_s(g_nid.szTip, L"ProxyPiTester - bridge active", _TRUNCATE);
+  wcsncpy_s(g_nid.szTip, L"ProxyPiTester - click to restore", _TRUNCATE);
+  if (balloon) {
+    g_nid.dwInfoFlags = NIIF_INFO;
+    wcsncpy_s(g_nid.szInfoTitle, L"ProxyPiTester is still running", _TRUNCATE);
+    wcsncpy_s(g_nid.szInfo,
+              L"Minimized to the system tray (near the clock). Click the icon to restore.",
+              _TRUNCATE);
+  }
   if (Shell_NotifyIconW(NIM_ADD, &g_nid)) g_trayAdded = true;
 }
 
 static void TrayShowWindow(HWND hwnd) {
+  ShowWindow(hwnd, SW_SHOW);
   ShowWindow(hwnd, SW_RESTORE);
   SetForegroundWindow(hwnd);
+  StartupLog(L"restored from tray");
 }
 
 // ---- Session status string (#4) ----
@@ -2854,7 +2885,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         0, 0, 160, 22, hwnd, (HMENU)ID_CHECK_TRAY, nullptr, nullptr);
       SetWindowTheme(hCheckTray, L"", L"");
       SendMessageW(hCheckTray, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
-      SendMessageW(hCheckTray, BM_SETCHECK, BST_CHECKED, 0);
+      // Default unchecked — tray hide looks like a crash to many users
+      SendMessageW(hCheckTray, BM_SETCHECK, BST_UNCHECKED, 0);
 
       // Legacy grid buttons kept hidden for menu-id compatibility (not shown)
       hBtnDevChrome = CreateStyledButton(hwnd, L"Chrome", 0, 0, 1, 1, ID_BTN_DEV_CHROME, true);
@@ -2951,8 +2983,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_SYSCOMMAND:
       if ((wParam & 0xFFF0) == SC_MINIMIZE && g_minimizeToTray) {
-        TrayAdd(hwnd);
+        TrayAdd(hwnd, true);
         ShowWindow(hwnd, SW_HIDE);
+        StartupLog(L"minimized to tray (not a crash)");
+        SetStatus(L"Minimized to tray — click the tray icon near the clock to restore.", COL_PRIMARY);
         return 0;
       }
       break;
@@ -3546,12 +3580,42 @@ static void StartupLog(const wchar_t* line) {
   } catch (...) {}
 }
 
+static void WriteMiniDump(EXCEPTION_POINTERS* ep) {
+  std::wstring path = GetExeDir() + L"\\ProxyPiTester-crash.dmp";
+  HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hFile == INVALID_HANDLE_VALUE) return;
+  HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+  if (dbg) {
+    typedef BOOL(WINAPI* MiniDumpWriteDump_t)(
+        HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+        PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+    auto fn = (MiniDumpWriteDump_t)GetProcAddress(dbg, "MiniDumpWriteDump");
+    if (fn) {
+      MINIDUMP_EXCEPTION_INFORMATION mei{};
+      mei.ThreadId = GetCurrentThreadId();
+      mei.ExceptionPointers = ep;
+      mei.ClientPointers = FALSE;
+      fn(GetCurrentProcess(), GetCurrentProcessId(), hFile, MiniDumpNormal,
+         ep ? &mei : nullptr, nullptr, nullptr);
+    }
+    FreeLibrary(dbg);
+  }
+  CloseHandle(hFile);
+  StartupLog((L"minidump: " + path).c_str());
+}
+
 static LONG WINAPI ProxyPiUnhandledException(EXCEPTION_POINTERS* ep) {
-  wchar_t buf[512];
+  wchar_t buf[640];
   DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
-  swprintf_s(buf, L"Unhandled exception 0x%08X. App will exit.\r\n\r\n"
-                  L"If this happens on open: right-click the EXE → Properties → Unblock,\r\n"
-                  L"or add an exclusion in Windows Security. See ProxyPiTester-startup.log.",
+  WriteMiniDump(ep);
+  swprintf_s(buf,
+             L"ProxyPiTester hit an error (0x%08X) and must close.\r\n\r\n"
+             L"Next to the EXE you will find:\r\n"
+             L"  • ProxyPiTester-startup.log\r\n"
+             L"  • ProxyPiTester-crash.dmp (if created)\r\n\r\n"
+             L"Also check: right-click EXE → Properties → Unblock.\r\n"
+             L"If you only minimized it: look for the tray icon near the clock.",
              code);
   StartupLog(buf);
   MessageBoxW(nullptr, buf, L"ProxyPiTester crashed", MB_OK | MB_ICONERROR);
