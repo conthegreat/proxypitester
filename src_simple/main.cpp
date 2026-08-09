@@ -30,7 +30,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.3.0";
+static const wchar_t* APP_VERSION = L"1.3.1";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -344,6 +344,9 @@ static std::wstring GetExeDir() {
   if (p != std::wstring::npos) s = s.substr(0, p);
   return s;
 }
+
+// Defined near wWinMain; declared early for WM_CREATE logging
+static void StartupLog(const wchar_t* line);
 
 static std::wstring GetIniPath() {
   return GetExeDir() + L"\\ProxyPiTester.ini";
@@ -2912,8 +2915,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       RefreshSessionList();
       SetTimer(hwnd, TIMER_SESSIONS, 2000, nullptr);
       SetTimer(hwnd, TIMER_HEALTH, 5000, nullptr);
-      DoCheckUpdates(true);
+      // Quiet update check is started from wWinMain after ShowWindow (not here)
       if (hAcctEmail) SetFocus(hAcctEmail);
+      StartupLog(L"WM_CREATE complete");
       return 0;
     }
 
@@ -3528,7 +3532,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
   return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// Startup log next to the EXE — helps diagnose silent close / AV / missing DLL
+static void StartupLog(const wchar_t* line) {
+  try {
+    std::wstring path = GetExeDir() + L"\\ProxyPiTester-startup.log";
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"a") != 0 || !f) return;
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fwprintf(f, L"%04u-%02u-%02u %02u:%02u:%02u  %s\n",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line);
+    fclose(f);
+  } catch (...) {}
+}
+
+static LONG WINAPI ProxyPiUnhandledException(EXCEPTION_POINTERS* ep) {
+  wchar_t buf[512];
+  DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+  swprintf_s(buf, L"Unhandled exception 0x%08X. App will exit.\r\n\r\n"
+                  L"If this happens on open: right-click the EXE → Properties → Unblock,\r\n"
+                  L"or add an exclusion in Windows Security. See ProxyPiTester-startup.log.",
+             code);
+  StartupLog(buf);
+  MessageBoxW(nullptr, buf, L"ProxyPiTester crashed", MB_OK | MB_ICONERROR);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+  SetUnhandledExceptionFilter(ProxyPiUnhandledException);
+  StartupLog(L"=== start ===");
+  StartupLog((std::wstring(L"version ") + APP_VERSION).c_str());
+
   // DPI awareness (#24) — per-monitor v2 when available
 #if defined(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -3539,7 +3573,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 #endif
 
   INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
-  InitCommonControlsEx(&icc);
+  if (!InitCommonControlsEx(&icc)) {
+    StartupLog(L"InitCommonControlsEx failed (continuing)");
+  }
 
   HICON hIconBig = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON,
     GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
@@ -3559,7 +3595,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   wc.hIcon = hIconBig;
   wc.hIconSm = hIconSm;
 
-  if (!RegisterClassExW(&wc)) return 1;
+  if (!RegisterClassExW(&wc)) {
+    DWORD err = GetLastError();
+    // Class already registered (second instance) — try to find existing window
+    if (err == ERROR_CLASS_ALREADY_EXISTS) {
+      HWND existing = FindWindowW(L"ProxyPiTesterMain", nullptr);
+      if (existing) {
+        ShowWindow(existing, SW_RESTORE);
+        SetForegroundWindow(existing);
+        StartupLog(L"second instance - activated existing window");
+        return 0;
+      }
+    }
+    wchar_t msg[256];
+    swprintf_s(msg, L"RegisterClassEx failed (error %lu). App cannot start.", err);
+    StartupLog(msg);
+    MessageBoxW(nullptr, msg, L"ProxyPiTester", MB_OK | MB_ICONERROR);
+    return 1;
+  }
 
   // Resizable + maximizable; larger default client area
   const DWORD style = WS_OVERLAPPEDWINDOW;
@@ -3577,6 +3630,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   int y = (sy - winH) / 2;
   if (y < 20) y = 20;
 
+  StartupLog(L"CreateWindowEx...");
   HWND hwnd = CreateWindowExW(
     WS_EX_CONTROLPARENT, L"ProxyPiTesterMain",
     L"ProxyPiTester",
@@ -3584,7 +3638,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     x, y, winW, winH,
     nullptr, nullptr, hInstance, nullptr);
 
-  if (!hwnd) return 1;
+  if (!hwnd) {
+    DWORD err = GetLastError();
+    wchar_t msg[320];
+    swprintf_s(msg,
+      L"Could not create the main window (error %lu).\r\n\r\n"
+      L"Common fixes:\r\n"
+      L"• Right-click ProxyPiTester.exe → Properties → Unblock → OK\r\n"
+      L"• Extract the zip to a folder first (do not run from inside the zip)\r\n"
+      L"• Windows Security may be blocking unsigned apps — allow this file\r\n"
+      L"• See ProxyPiTester-startup.log next to the EXE",
+      err);
+    StartupLog(msg);
+    MessageBoxW(nullptr, msg, L"ProxyPiTester failed to start", MB_OK | MB_ICONERROR);
+    return 1;
+  }
+  StartupLog(L"window created OK");
 
   SetMenu(hwnd, CreateAppMenu());
   DrawMenuBar(hwnd);
@@ -3592,11 +3661,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
   SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSm);
 
-  ShowWindow(hwnd, nCmdShow);
+  ShowWindow(hwnd, nCmdShow == SW_HIDE ? SW_SHOW : nCmdShow);
   UpdateWindow(hwnd);
+  // Quiet update check after UI is visible
+  DoCheckUpdates(true);
 
   MSG msg;
-  while (GetMessage(&msg, nullptr, 0, 0)) {
+  while (GetMessage(&msg, nullptr, 0, 0) > 0) {
     // Enables Tab / Shift+Tab between email, password, and other controls
     if (hMain && IsDialogMessageW(hMain, &msg)) {
       continue;
@@ -3604,5 +3675,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }
+  StartupLog(L"=== exit ===");
   return (int)msg.wParam;
 }
