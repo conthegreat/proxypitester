@@ -1,4 +1,4 @@
-ProxyPiTester v1.3.2
+ProxyPiTester v1.3.3
 ====================
 
 UK residential proxy test & app routing for ProxyPi.
@@ -8,6 +8,7 @@ If the window "disappears"
 --------------------------
 Look near the clock (system tray) for the ProxyPiTester icon and click it.
 "Minimize to tray" is OFF by default in 1.3.2+.
+Speed Test downloads a sample of the 100 MB test file through your proxy.
 
 If it truly will not start
 --------------------------

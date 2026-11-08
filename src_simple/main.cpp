@@ -32,7 +32,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.3.2";
+static const wchar_t* APP_VERSION = L"1.3.3";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -2294,12 +2294,18 @@ static void DoSpeed() {
     return;
   }
   SetBusy(true);
-  SetStatus(L"Running speed test (IP check + ~1 MB download)...", COL_PRIMARY);
+  SetStatus(L"Running speed test (sample of 100mb.bin through your proxy)...", COL_PRIMARY);
   AppendResult(L"--- Speed test ---");
 
   std::thread([cfg]() {
-    SpeedTestResult r = SpeedTestProxy(cfg);
-    auto* heap = new SpeedTestResult(r);
+    SpeedTestResult r;
+    try {
+      r = SpeedTestProxy(cfg);
+    } catch (...) {
+      r.success = false;
+      r.message = L"Speed test failed (internal error).";
+    }
+    auto* heap = new SpeedTestResult(std::move(r));
     PostMessageW(hMain, WM_APP_SPEED_DONE, 0, (LPARAM)heap);
   }).detach();
 }
@@ -3361,6 +3367,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
           AppendResult(L"SUCCESS - speed test");
           AppendResult(L"  Exit IP   : " + r->detectedIp);
           AppendResult(L"  Latency   : " + std::to_wstring(r->latencyMs) + L" ms");
+          AppendResult(L"  File      : 100mb.bin");
           AppendResult(L"  Download  : " + std::wstring(speed) + L" Mbps");
           AppendResult(L"  Bytes     : " + std::to_wstring((long long)r->bytesDownloaded));
           AppendResult(L"  Duration  : " + std::to_wstring(r->downloadMs) + L" ms");

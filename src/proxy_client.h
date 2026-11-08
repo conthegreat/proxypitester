@@ -44,6 +44,7 @@ struct SpeedTestResult {
   int downloadMs = 0;
 };
 
-// Downloads a ~1–5 MB payload through the proxy (plain HTTP) to measure Mbps.
-// Optionally reuses a recent IP check (pass empty to also fetch IP).
+// Downloads https://github.com/conthegreat/speedtest/releases/download/100mb-test/100mb.bin
+// through the proxy (SOCKS5 or HTTP) and measures Mbps.
+// Samples up to 20 MB or 10 seconds of that file so one click does not pull the whole 100 MB.
 SpeedTestResult SpeedTestProxy(const ProxyConfig& cfg);

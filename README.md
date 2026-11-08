@@ -3,7 +3,7 @@
 Windows desktop tool for [ProxyPi](https://proxypi.co.uk) — **UK residential SOCKS5 / HTTP** proxy testing and **app routing**.
 
 ![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-blue)
-![Version](https://img.shields.io/badge/version-1.3.2-00bcd4)
+![Version](https://img.shields.io/badge/version-1.3.3-00bcd4)
 
 ## Download
 
@@ -16,7 +16,7 @@ Zip contains `ProxyPiTester.exe` only (no credentials).
 - **Login & Load My Proxy** via your ProxyPi account (fills host, ports, credentials)
 - **Remember me** — optionally save account email/password locally
 - SOCKS5 / HTTP connectivity test (exit IP + latency)
-- Download speed test through your proxy
+- Download speed test through your proxy (100 MB file, short sample)
 - **App routing** through a shared local SOCKS bridge (auth handled for you):
   - Chrome, Edge, Brave, Firefox, Opera, Vivaldi
   - Discord, Slack, Teams, VS Code, Cursor, Postman, Thunderbird, Spotify

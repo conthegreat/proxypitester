@@ -3,7 +3,11 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
+#define SECURITY_WIN32
+#include <security.h>
+#include <schannel.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "secur32.lib")
 
 static bool g_winsockInit = false;
 
@@ -86,15 +90,17 @@ static bool Socks5Auth(SOCKET s, const ProxyConfig& cfg, std::wstring& err) {
   std::string user = cfg.usernameA();
   std::string pass = cfg.passwordA();
 
-  unsigned char buf[512];
+  unsigned char buf[600];
   size_t idx = 0;
+  size_t ulen = std::min<size_t>(255, user.size());
+  size_t plen = std::min<size_t>(255, pass.size());
   buf[idx++] = 0x01;                 // subnegotiation version
-  buf[idx++] = (unsigned char)std::min<size_t>(255, user.size());
-  memcpy(&buf[idx], user.data(), user.size());
-  idx += user.size();
-  buf[idx++] = (unsigned char)std::min<size_t>(255, pass.size());
-  memcpy(&buf[idx], pass.data(), pass.size());
-  idx += pass.size();
+  buf[idx++] = (unsigned char)ulen;
+  if (ulen) memcpy(&buf[idx], user.data(), ulen);
+  idx += ulen;
+  buf[idx++] = (unsigned char)plen;
+  if (plen) memcpy(&buf[idx], pass.data(), plen);
+  idx += plen;
 
   if (send(s, (char*)buf, (int)idx, 0) != (int)idx) {
     err = L"SOCKS5 auth send failed";
@@ -440,83 +446,459 @@ ProxyTestResult TestProxy(const ProxyConfig& cfg, const std::string& testHost, i
   return res;
 }
 
-// Stream an HTTP GET body through an open tunnel; count bytes only (no full buffer).
-static bool DownloadHttpGetCount(SOCKET s, const std::string& host, const std::string& path,
-                                 size_t maxBytes, size_t& outBytes, std::wstring& err) {
-  outBytes = 0;
-  std::string req = "GET " + path + " HTTP/1.1\r\n";
-  req += "Host: " + host + "\r\n";
-  req += "User-Agent: ProxyPi-Tester/1.0\r\n";
-  req += "Connection: close\r\n\r\n";
+// Public 100 MB payload. GitHub 302s this to release-assets.githubusercontent.com.
+static const char* kSpeedTestUrl =
+    "https://github.com/conthegreat/speedtest/releases/download/100mb-test/100mb.bin";
+static const int kSpeedSampleMs = 10000;
+static const size_t kSpeedMinBytes = 64 * 1024;
+// Stop at 20 MB or 10 seconds. The file is 100 MB; a full pull would burn proxy quota.
+static const size_t kSpeedMaxBytes = 20ull * 1024ull * 1024ull;
 
-  if (send(s, req.data(), (int)req.size(), 0) != (int)req.size()) {
-    err = L"Speed test HTTP GET send failed";
+static bool SendAllSock(SOCKET s, const char* data, int n) {
+  int sent = 0;
+  while (sent < n) {
+    int r = send(s, data + sent, n - sent, 0);
+    if (r <= 0) return false;
+    sent += r;
+  }
+  return true;
+}
+
+struct HttpsUrl {
+  std::string host;
+  std::string path; // includes query, starts with /
+  int port = 443;
+};
+
+static bool ParseHttpsUrl(const std::string& url, HttpsUrl& out) {
+  const std::string pfx = "https://";
+  if (url.size() <= pfx.size() || url.compare(0, pfx.size(), pfx) != 0) return false;
+  std::string rest = url.substr(pfx.size());
+  size_t slash = rest.find('/');
+  std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+  out.path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
+  if (hostport.empty() || out.path.empty()) return false;
+  size_t colon = hostport.rfind(':');
+  if (colon != std::string::npos && hostport.find(']') == std::string::npos) {
+    out.host = hostport.substr(0, colon);
+    out.port = atoi(hostport.c_str() + colon + 1);
+    if (out.port <= 0) out.port = 443;
+  } else {
+    out.host = hostport;
+    out.port = 443;
+  }
+  return !out.host.empty();
+}
+
+// One TLS session over an already-open proxy tunnel. Single threaded on purpose:
+// the previous WinHTTP local-proxy design spawned extra threads and could take
+// the process down with them.
+struct TlsConn {
+  SOCKET sock = INVALID_SOCKET;
+  CredHandle cred{};
+  CtxtHandle ctx{};
+  bool hasCred = false;
+  bool hasCtx = false;
+  SecPkgContext_StreamSizes sizes{};
+  std::vector<char> enc;
+  std::vector<char> plain;
+
+  ~TlsConn() {
+    if (hasCtx) DeleteSecurityContext(&ctx);
+    if (hasCred) FreeCredentialsHandle(&cred);
+  }
+};
+
+static bool TlsHandshake(TlsConn& t, const std::string& host, std::wstring& err) {
+  SCHANNEL_CRED sc{};
+  sc.dwVersion = SCHANNEL_CRED_VERSION;
+  sc.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION | SCH_CRED_NO_DEFAULT_CREDS | SCH_USE_STRONG_CRYPTO;
+
+  TimeStamp exp{};
+  SECURITY_STATUS ss = AcquireCredentialsHandleA(
+      nullptr, const_cast<SEC_CHAR*>(UNISP_NAME_A), SECPKG_CRED_OUTBOUND,
+      nullptr, &sc, nullptr, nullptr, &t.cred, &exp);
+  if (ss != SEC_E_OK) {
+    err = L"TLS init failed (" + std::to_wstring((long)ss) + L")";
     return false;
   }
+  t.hasCred = true;
 
-  std::string headers;
-  char buf[8192];
-  bool headersDone = false;
+  const DWORD flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT | ISC_REQ_CONFIDENTIALITY |
+                      ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
+  std::vector<char> incoming;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
 
-  auto tDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
-
-  while (!headersDone) {
-    if (std::chrono::steady_clock::now() > tDeadline) {
-      err = L"Speed test timed out reading headers";
+  for (;;) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      err = L"TLS handshake timed out";
       return false;
     }
-    int n = recv(s, buf, sizeof(buf), 0);
-    if (n <= 0) {
-      err = L"Speed test failed reading HTTP headers";
-      return false;
-    }
-    headers.append(buf, n);
-    size_t sep = headers.find("\r\n\r\n");
-    if (sep != std::string::npos) {
-      headersDone = true;
-      // Any body bytes already received after headers
-      size_t bodyInBuf = headers.size() - (sep + 4);
-      if (bodyInBuf > 0) {
-        outBytes += bodyInBuf;
+
+    SecBuffer ib[2]{};
+    ib[0].BufferType = SECBUFFER_TOKEN;
+    ib[0].pvBuffer = incoming.empty() ? nullptr : incoming.data();
+    ib[0].cbBuffer = (ULONG)incoming.size();
+    ib[1].BufferType = SECBUFFER_EMPTY;
+    SecBufferDesc inDesc{ SECBUFFER_VERSION, 2, ib };
+
+    SecBuffer ob[1]{};
+    ob[0].BufferType = SECBUFFER_TOKEN;
+    SecBufferDesc outDesc{ SECBUFFER_VERSION, 1, ob };
+    DWORD outFlags = 0;
+
+    ss = InitializeSecurityContextA(
+        &t.cred,
+        t.hasCtx ? &t.ctx : nullptr,
+        t.hasCtx ? nullptr : const_cast<SEC_CHAR*>(host.c_str()),
+        flags, 0, 0,
+        incoming.empty() ? nullptr : &inDesc,
+        0,
+        t.hasCtx ? nullptr : &t.ctx,
+        &outDesc,
+        &outFlags,
+        &exp);
+
+    if (!t.hasCtx && (ss == SEC_I_CONTINUE_NEEDED || ss == SEC_E_OK)) t.hasCtx = true;
+
+    if (ob[0].cbBuffer && ob[0].pvBuffer) {
+      bool sent = SendAllSock(t.sock, (const char*)ob[0].pvBuffer, (int)ob[0].cbBuffer);
+      FreeContextBuffer(ob[0].pvBuffer);
+      if (!sent) {
+        err = L"TLS handshake send failed";
+        return false;
       }
-      // Keep only the header part for status check
-      headers.resize(sep);
     }
-    if (headers.size() > 32 * 1024) {
-      err = L"Speed test: HTTP headers too large";
-      return false;
-    }
-  }
 
-  // Status line check
-  bool is200 = false;
-  size_t httpPos = headers.find("HTTP/");
-  if (httpPos != std::string::npos) {
-    size_t space = headers.find(' ', httpPos);
-    if (space != std::string::npos && space + 4 <= headers.size()) {
-      if (headers.substr(space + 1, 3) == "200") is200 = true;
-    }
-  }
-  if (!is200) {
-    size_t lineEnd = headers.find("\r\n");
-    std::string first = (lineEnd != std::string::npos) ? headers.substr(0, lineEnd) : headers;
-    err = L"Speed test HTTP failed: " + std::wstring(first.begin(), first.end());
-    return false;
-  }
-
-  // Stream remaining body up to maxBytes
-  while (outBytes < maxBytes) {
-    if (std::chrono::steady_clock::now() > tDeadline) {
-      // Partial download still usable for speed estimate
+    if (ss == SEC_E_OK) {
+      if (ib[1].BufferType == SECBUFFER_EXTRA && ib[1].cbBuffer > 0 &&
+          ib[1].cbBuffer <= incoming.size()) {
+        size_t extra = ib[1].cbBuffer;
+        t.enc.assign(incoming.end() - (ptrdiff_t)extra, incoming.end());
+      }
       break;
     }
-    int want = (int)std::min<size_t>(sizeof(buf), maxBytes - outBytes);
-    int n = recv(s, buf, want, 0);
-    if (n <= 0) break;
-    outBytes += (size_t)n;
+
+    if (ss == SEC_E_INCOMPLETE_MESSAGE || ss == SEC_I_CONTINUE_NEEDED) {
+      if (ss == SEC_I_CONTINUE_NEEDED) {
+        if (ib[1].BufferType == SECBUFFER_EXTRA && ib[1].cbBuffer > 0 &&
+            ib[1].cbBuffer <= incoming.size()) {
+          size_t extra = ib[1].cbBuffer;
+          std::vector<char> keep(incoming.end() - (ptrdiff_t)extra, incoming.end());
+          incoming.swap(keep);
+        } else {
+          incoming.clear();
+        }
+      }
+      char tmp[8192];
+      int n = recv(t.sock, tmp, sizeof(tmp), 0);
+      if (n <= 0) {
+        err = L"TLS handshake failed while reading";
+        return false;
+      }
+      incoming.insert(incoming.end(), tmp, tmp + n);
+      continue;
+    }
+
+    err = L"TLS handshake failed (" + std::to_wstring((long)ss) + L")";
+    return false;
   }
 
-  return outBytes > 0;
+  ss = QueryContextAttributes(&t.ctx, SECPKG_ATTR_STREAM_SIZES, &t.sizes);
+  if (ss != SEC_E_OK || t.sizes.cbMaximumMessage == 0) {
+    err = L"TLS stream setup failed";
+    return false;
+  }
+  return true;
+}
+
+static bool TlsSend(TlsConn& t, const char* data, size_t len, std::wstring& err) {
+  size_t off = 0;
+  while (off < len) {
+    size_t chunk = std::min<size_t>(len - off, t.sizes.cbMaximumMessage);
+    std::vector<char> buf(t.sizes.cbHeader + chunk + t.sizes.cbTrailer);
+    memcpy(buf.data() + t.sizes.cbHeader, data + off, chunk);
+
+    SecBuffer sb[4]{};
+    sb[0].BufferType = SECBUFFER_STREAM_HEADER;
+    sb[0].pvBuffer = buf.data();
+    sb[0].cbBuffer = t.sizes.cbHeader;
+    sb[1].BufferType = SECBUFFER_DATA;
+    sb[1].pvBuffer = buf.data() + t.sizes.cbHeader;
+    sb[1].cbBuffer = (ULONG)chunk;
+    sb[2].BufferType = SECBUFFER_STREAM_TRAILER;
+    sb[2].pvBuffer = buf.data() + t.sizes.cbHeader + chunk;
+    sb[2].cbBuffer = t.sizes.cbTrailer;
+    sb[3].BufferType = SECBUFFER_EMPTY;
+    SecBufferDesc desc{ SECBUFFER_VERSION, 4, sb };
+
+    SECURITY_STATUS ss = EncryptMessage(&t.ctx, 0, &desc, 0);
+    if (ss != SEC_E_OK) {
+      err = L"TLS encrypt failed";
+      return false;
+    }
+    int total = (int)(sb[0].cbBuffer + sb[1].cbBuffer + sb[2].cbBuffer);
+    if (!SendAllSock(t.sock, buf.data(), total)) {
+      err = L"TLS send failed";
+      return false;
+    }
+    off += chunk;
+  }
+  return true;
+}
+
+// Append decrypted bytes to t.plain. false means the peer closed or an error.
+static bool TlsRecv(TlsConn& t, std::wstring& err) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  for (;;) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      err = L"TLS read timed out";
+      return false;
+    }
+    if (t.enc.empty()) {
+      char tmp[16384];
+      int n = recv(t.sock, tmp, sizeof(tmp), 0);
+      if (n <= 0) return false;
+      t.enc.insert(t.enc.end(), tmp, tmp + n);
+    }
+
+    SecBuffer sb[4]{};
+    sb[0].BufferType = SECBUFFER_DATA;
+    sb[0].pvBuffer = t.enc.data();
+    sb[0].cbBuffer = (ULONG)t.enc.size();
+    sb[1].BufferType = SECBUFFER_EMPTY;
+    sb[2].BufferType = SECBUFFER_EMPTY;
+    sb[3].BufferType = SECBUFFER_EMPTY;
+    SecBufferDesc desc{ SECBUFFER_VERSION, 4, sb };
+
+    SECURITY_STATUS ss = DecryptMessage(&t.ctx, &desc, 0, nullptr);
+    if (ss == SEC_E_INCOMPLETE_MESSAGE) {
+      char tmp[16384];
+      int n = recv(t.sock, tmp, sizeof(tmp), 0);
+      if (n <= 0) return false;
+      t.enc.insert(t.enc.end(), tmp, tmp + n);
+      continue;
+    }
+    if (ss == SEC_I_CONTEXT_EXPIRED || ss == SEC_I_RENEGOTIATE) return false;
+    if (ss != SEC_E_OK) {
+      err = L"TLS decrypt failed";
+      return false;
+    }
+
+    char* data = nullptr;
+    ULONG dataLen = 0;
+    char* extra = nullptr;
+    ULONG extraLen = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (sb[i].BufferType == SECBUFFER_DATA) {
+        data = (char*)sb[i].pvBuffer;
+        dataLen = sb[i].cbBuffer;
+      } else if (sb[i].BufferType == SECBUFFER_EXTRA) {
+        extra = (char*)sb[i].pvBuffer;
+        extraLen = sb[i].cbBuffer;
+      }
+    }
+    if (data && dataLen) t.plain.insert(t.plain.end(), data, data + dataLen);
+    if (extra && extraLen) {
+      std::vector<char> rest(extra, extra + extraLen);
+      t.enc.swap(rest);
+    } else {
+      t.enc.clear();
+    }
+    if (!t.plain.empty()) return true;
+  }
+}
+
+static bool ReadHttpHeaders(TlsConn& t, std::string& header, std::string& preBody, std::wstring& err) {
+  std::string acc;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (acc.find("\r\n\r\n") == std::string::npos) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      err = L"Timed out waiting for download headers";
+      return false;
+    }
+    if (t.plain.empty() && !TlsRecv(t, err) && t.plain.empty()) {
+      if (err.empty()) err = L"Connection closed before download headers";
+      return false;
+    }
+    acc.append(t.plain.data(), t.plain.size());
+    t.plain.clear();
+    if (acc.size() > 256 * 1024) {
+      err = L"Download headers too large";
+      return false;
+    }
+  }
+  size_t sep = acc.find("\r\n\r\n");
+  header = acc.substr(0, sep);
+  preBody = acc.substr(sep + 4);
+  return true;
+}
+
+static int HttpStatusCode(const std::string& header) {
+  size_t p = header.find("HTTP/");
+  if (p == std::string::npos) return 0;
+  size_t sp = header.find(' ', p);
+  if (sp == std::string::npos || sp + 4 > header.size()) return 0;
+  return atoi(header.c_str() + sp + 1);
+}
+
+static std::string HeaderValue(const std::string& header, const char* name) {
+  std::string lower = header;
+  for (char& c : lower) {
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+  }
+  std::string key = name;
+  for (char& c : key) {
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+  }
+  key += ':';
+  size_t p = 0;
+  while (p < lower.size()) {
+    size_t lineEnd = lower.find("\r\n", p);
+    if (lineEnd == std::string::npos) lineEnd = lower.size();
+    if (lower.compare(p, key.size(), key) == 0) {
+      size_t vs = p + key.size();
+      while (vs < lineEnd && (header[vs] == ' ' || header[vs] == '\t')) vs++;
+      return header.substr(vs, lineEnd - vs);
+    }
+    if (lineEnd == lower.size()) break;
+    p = lineEnd + 2;
+  }
+  return {};
+}
+
+static SOCKET OpenProxyTunnel(const ProxyConfig& cfg, const std::string& host, int port, std::wstring& err) {
+  SOCKET s = INVALID_SOCKET;
+  if (!ConnectTcp(cfg.hostA(), cfg.port, s, err)) return INVALID_SOCKET;
+  int to = 20000;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+  bool ok = (cfg.type == ProxyType::SOCKS5)
+                ? Socks5Connect(s, cfg, host, port, err)
+                : HttpProxyConnect(s, cfg, host, port, err);
+  if (!ok) {
+    closesocket(s);
+    return INVALID_SOCKET;
+  }
+  return s;
+}
+
+static bool DownloadSpeedFile(const ProxyConfig& cfg, size_t& outBytes, int& outMs, std::wstring& err) {
+  outBytes = 0;
+  outMs = 0;
+  HttpsUrl cur;
+  if (!ParseHttpsUrl(kSpeedTestUrl, cur)) {
+    err = L"Bad speed-test URL";
+    return false;
+  }
+
+  for (int hop = 0; hop < 5; ++hop) {
+    SOCKET s = OpenProxyTunnel(cfg, cur.host, cur.port, err);
+    if (s == INVALID_SOCKET) {
+      if (err.empty()) err = L"Could not tunnel to the download server";
+      return false;
+    }
+
+    bool redirect = false;
+    HttpsUrl next;
+    {
+      TlsConn tls;
+      tls.sock = s;
+      if (!TlsHandshake(tls, cur.host, err)) {
+        closesocket(s);
+        return false;
+      }
+
+      std::string req = "GET " + cur.path + " HTTP/1.1\r\n";
+      req += "Host: " + cur.host + "\r\n";
+      req += "User-Agent: ProxyPiTester/1.3\r\n";
+      req += "Accept: */*\r\n";
+      req += "Connection: close\r\n\r\n";
+      if (!TlsSend(tls, req.data(), req.size(), err)) {
+        closesocket(s);
+        return false;
+      }
+
+      std::string header, preBody;
+      if (!ReadHttpHeaders(tls, header, preBody, err)) {
+        closesocket(s);
+        return false;
+      }
+
+      int status = HttpStatusCode(header);
+      if (status >= 300 && status < 400) {
+        std::string loc = HeaderValue(header, "location");
+        if (loc.rfind("https://", 0) == 0) {
+          if (!ParseHttpsUrl(loc, next)) {
+            err = L"Download redirect was not a usable HTTPS URL";
+            closesocket(s);
+            return false;
+          }
+        } else if (!loc.empty() && loc[0] == '/') {
+          next = cur;
+          next.path = loc;
+        } else {
+          err = L"Download redirect was not HTTPS";
+          closesocket(s);
+          return false;
+        }
+        redirect = true;
+      } else if (status != 200) {
+        err = L"Download HTTP " + std::to_wstring(status);
+        closesocket(s);
+        return false;
+      } else {
+        std::string pending = preBody;
+        std::string lenStr = HeaderValue(header, "content-length");
+        bool haveLen = !lenStr.empty();
+        size_t contentLen = haveLen ? (size_t)strtoull(lenStr.c_str(), nullptr, 10) : 0;
+        auto t0 = std::chrono::steady_clock::now();
+        const auto deadline = t0 + std::chrono::milliseconds(kSpeedSampleMs);
+
+        auto take = [&](const char* p, size_t n) {
+          if (n == 0 || outBytes >= kSpeedMaxBytes) return;
+          size_t room = kSpeedMaxBytes - outBytes;
+          if (n > room) n = room;
+          if (haveLen && outBytes + n > contentLen) {
+            if (contentLen > outBytes) n = contentLen - outBytes;
+            else n = 0;
+          }
+          outBytes += n;
+          (void)p;
+        };
+
+        take(pending.data(), pending.size());
+        while (outBytes < kSpeedMaxBytes &&
+               !(haveLen && outBytes >= contentLen) &&
+               std::chrono::steady_clock::now() < deadline) {
+          if (tls.plain.empty() && !TlsRecv(tls, err)) break;
+          if (tls.plain.empty()) break;
+          take(tls.plain.data(), tls.plain.size());
+          tls.plain.clear();
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        outMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        if (outMs < 1) outMs = 1;
+        closesocket(s);
+        if (outBytes < kSpeedMinBytes) {
+          err = L"Downloaded only " + std::to_wstring((long long)outBytes) +
+                L" bytes from 100mb.bin (need a larger sample)";
+          return false;
+        }
+        err.clear();
+        return true;
+      }
+    }
+    closesocket(s);
+    if (!redirect) {
+      err = L"Download failed";
+      return false;
+    }
+    cur = next;
+  }
+
+  err = L"Too many redirects fetching 100mb.bin";
+  return false;
 }
 
 SpeedTestResult SpeedTestProxy(const ProxyConfig& cfg) {
@@ -527,7 +909,6 @@ SpeedTestResult SpeedTestProxy(const ProxyConfig& cfg) {
     return res;
   }
 
-  // Phase 1: quick IP + latency check (reuses existing tester)
   auto t0 = std::chrono::steady_clock::now();
   ProxyTestResult ipTest = TestProxy(cfg, "api.ipify.org", 80);
   auto t1 = std::chrono::steady_clock::now();
@@ -541,61 +922,26 @@ SpeedTestResult SpeedTestProxy(const ProxyConfig& cfg) {
     return res;
   }
 
-  // Phase 2: download a known payload through the proxy for throughput
-  // Prefer a modest 1MB file so tests finish quickly on residential links.
-  const std::string dlHost = "speedtest.tele2.net";
-  const std::string dlPath = "/1MB.zip";
-  const int dlPort = 80;
-  const size_t targetBytes = 1024 * 1024; // stop after ~1 MB
-
-  SOCKET proxySock = INVALID_SOCKET;
-  if (!ConnectTcp(cfg.hostA(), cfg.port, proxySock, err)) {
-    res.message = L"IP OK, but speed test connect failed: " + err;
-    // Still report partial success with IP
-    res.success = true;
-    res.downloadMbps = 0;
-    return res;
-  }
-
-  int recvTimeoutMs = 20000;
-  setsockopt(proxySock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeoutMs, sizeof(recvTimeoutMs));
-  int sendTimeoutMs = 15000;
-  setsockopt(proxySock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeoutMs, sizeof(sendTimeoutMs));
-
-  bool tunnelOk = false;
-  if (cfg.type == ProxyType::SOCKS5) {
-    tunnelOk = Socks5Connect(proxySock, cfg, dlHost, dlPort, err);
-  } else {
-    tunnelOk = HttpProxyConnect(proxySock, cfg, dlHost, dlPort, err);
-  }
-  if (!tunnelOk) {
-    closesocket(proxySock);
-    res.message = L"IP OK, speed tunnel failed: " + err;
-    res.success = true;
-    return res;
-  }
-
-  auto td0 = std::chrono::steady_clock::now();
   size_t bytes = 0;
-  if (!DownloadHttpGetCount(proxySock, dlHost, dlPath, targetBytes, bytes, err)) {
-    closesocket(proxySock);
-    res.message = L"IP OK, download failed: " + err;
-    res.success = true;
+  int downloadMs = 0;
+  bool ok = DownloadSpeedFile(cfg, bytes, downloadMs, err);
+  if (!ok) {
+    res.message = L"Exit IP " + res.detectedIp + L". " + err;
     return res;
   }
-  auto td1 = std::chrono::steady_clock::now();
-  closesocket(proxySock);
 
   res.bytesDownloaded = bytes;
-  res.downloadMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(td1 - td0).count();
-  if (res.downloadMs < 1) res.downloadMs = 1;
-
+  res.downloadMs = downloadMs;
   // Mbps = (bytes * 8) / (ms / 1000) / 1_000_000 = bytes * 8 / ms / 1000
   res.downloadMbps = (double)bytes * 8.0 / (double)res.downloadMs / 1000.0;
   res.success = true;
 
   wchar_t speedBuf[64];
   swprintf_s(speedBuf, L"%.2f", res.downloadMbps);
-  res.message = L"Speed test complete - " + std::wstring(speedBuf) + L" Mbps down";
+  double mb = (double)bytes / (1024.0 * 1024.0);
+  wchar_t mbBuf[32];
+  swprintf_s(mbBuf, L"%.1f", mb);
+  res.message = L"Speed test complete - " + std::wstring(speedBuf) +
+                L" Mbps (" + std::wstring(mbBuf) + L" MB of 100mb.bin)";
   return res;
 }

@@ -1,5 +1,5 @@
 {
-  "version": "1.3.2",
+  "version": "1.3.3",
   "download_url": "https://github.com/conthegreat/proxypitester/releases/latest",
-  "notes": "1.3.2: Fix minimize-to-tray looking like a crash (default off + balloon tip). Crash dump + clearer errors if it really fails."
+  "notes": "1.3.3: Speed test downloads the 100 MB test file through your proxy."
 }
