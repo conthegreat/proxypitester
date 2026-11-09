@@ -1,5 +1,5 @@
 {
-  "version": "1.3.3",
+  "version": "1.3.4",
   "download_url": "https://github.com/conthegreat/proxypitester/releases/latest",
-  "notes": "1.3.3: Speed test downloads the 100 MB test file through your proxy."
+  "notes": "1.3.4: Refreshed layout, the real app icon, and clearer panels."
 }

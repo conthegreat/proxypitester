@@ -18,6 +18,7 @@
 #include <cctype>
 
 #include <uxtheme.h>
+#include <dwmapi.h>
 #include <dbghelp.h>
 
 #pragma comment(lib, "comctl32.lib")
@@ -27,12 +28,14 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.3.3";
+static const wchar_t* APP_VERSION = L"1.3.4";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -87,20 +90,23 @@ static bool OpenUrlInDefaultBrowser(HWND hwnd, const std::wstring& urlIn) {
 static const wchar_t* DESKTOP_API_HOST = L"proxypi.co.uk";
 static const wchar_t* DESKTOP_LOGIN_PATH = L"/api/desktop/login";
 
-// ---- ProxyPi brand palette (from proxypi.co.uk CSS) ----
-static const COLORREF COL_BG         = RGB(15, 23, 42);     // #0f172a
-static const COLORREF COL_BG_DEEP    = RGB(2, 6, 23);       // #020617
-static const COLORREF COL_CARD       = RGB(17, 24, 39);     // #111827
-static const COLORREF COL_PRIMARY    = RGB(0, 188, 212);    // #00bcd4
-static const COLORREF COL_PRIMARY_D  = RGB(0, 159, 181);    // #009fb5
-static const COLORREF COL_PRIMARY_DD = RGB(0, 143, 163);    // #008fa3
-static const COLORREF COL_TEXT       = RGB(248, 250, 252);  // #f8fafc
-static const COLORREF COL_TEXT_BODY  = RGB(226, 232, 240);  // #e2e8f0
-static const COLORREF COL_TEXT_DIM   = RGB(148, 163, 184);  // #94a3b8
-static const COLORREF COL_BORDER     = RGB(30, 41, 59);     // slate-800-ish
-static const COLORREF COL_SUCCESS    = RGB(34, 197, 94);    // green-500
-static const COLORREF COL_ERROR      = RGB(239, 68, 68);    // red-500
-static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent glow
+// ---- ProxyPi brand palette (local visual pass; same product, richer contrast) ----
+static const COLORREF COL_BG         = RGB(8, 12, 20);
+static const COLORREF COL_BG_DEEP    = RGB(14, 20, 34);     // input wells
+static const COLORREF COL_CARD       = RGB(17, 25, 41);
+static const COLORREF COL_PRIMARY    = RGB(34, 211, 238);   // bright cyan
+static const COLORREF COL_PRIMARY_D  = RGB(56, 224, 248);   // hover
+static const COLORREF COL_PRIMARY_DD = RGB(8, 168, 196);    // pressed
+static const COLORREF COL_ON_PRIMARY = RGB(7, 18, 28);      // text on cyan
+static const COLORREF COL_TEXT       = RGB(241, 245, 249);
+static const COLORREF COL_TEXT_BODY  = RGB(203, 213, 225);
+static const COLORREF COL_TEXT_DIM   = RGB(148, 163, 184);
+static const COLORREF COL_BORDER     = RGB(51, 68, 92);
+static const COLORREF COL_CARD_LINE  = RGB(96, 122, 158);   // panel outline, lighter than the canvas
+static const COLORREF COL_FIELD_LINE = RGB(32, 46, 68);     // recessed control outline, darker than the panel
+static const COLORREF COL_SUCCESS    = RGB(52, 211, 153);
+static const COLORREF COL_ERROR      = RGB(248, 113, 113);
+static const COLORREF COL_INDIGO     = RGB(129, 140, 248);
 
 // Control IDs
 #define ID_COMBO_TYPE   2001
@@ -176,6 +182,8 @@ static const COLORREF COL_INDIGO     = RGB(99, 102, 241);   // #6366f1 accent gl
 #define TRAY_ICON_ID    1
 
 static HWND hMain = nullptr;
+static HMENU g_menuBar = nullptr;
+static int g_menuHot = 0; // 1 = File, 2 = Help
 static HWND hComboType = nullptr;
 static HWND hHost = nullptr, hPort = nullptr;
 static HWND hCheckAuth = nullptr;
@@ -225,6 +233,10 @@ static HFONT hFontUi = nullptr;
 static HFONT hFontTitle = nullptr;
 static HFONT hFontSmall = nullptr;
 static HFONT hFontMono = nullptr;
+static HFONT hFontBtn = nullptr;
+static HFONT hFontMetric = nullptr;
+static HFONT hFontSection = nullptr;
+static HICON g_headerIcon = nullptr;
 static HBRUSH hBrushBg = nullptr;
 static HBRUSH hBrushCard = nullptr;
 static HBRUSH hBrushInput = nullptr;
@@ -283,6 +295,10 @@ static const int MIN_CLIENT_W = 700;
 // Short windows scroll instead of squashing — keep a usable min track height
 static const int MIN_CLIENT_H = 520;
 static const int PAD = 24;
+// Largest image in ProxyPiTester.ico. Drawn 1:1 so the header mark stays sharp.
+static const int HEADER_ICON_PX = 48;
+// Painted command strip. Replaces the native menu bar, which stays white on Windows 11.
+static const int MENU_STRIP_H = 34;
 // Side-by-side account | config when client is at least this wide
 static const int SIDE_BY_SIDE_MIN_W = 900;
 // Comfortable preferred heights for list/results when space is tight (scroll covers rest)
@@ -1411,33 +1427,67 @@ static void ClearChromePath() {
   SetStatus(L"Chrome path: auto-detect.", COL_TEXT_DIM);
 }
 
+static void AddMenuItem(HMENU menu, UINT id, const wchar_t* text) {
+  MENUITEMINFOW mi{};
+  mi.cbSize = sizeof(mi);
+  mi.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING;
+  mi.fType = MFT_OWNERDRAW;
+  mi.wID = id;
+  mi.dwTypeData = const_cast<LPWSTR>(text);
+  mi.cch = (UINT)wcslen(text);
+  mi.dwItemData = (ULONG_PTR)text;
+  InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &mi);
+}
+
+static void AddMenuSep(HMENU menu) {
+  MENUITEMINFOW mi{};
+  mi.cbSize = sizeof(mi);
+  mi.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
+  mi.fType = MFT_OWNERDRAW;
+  mi.wID = 0;
+  mi.dwItemData = 0;
+  InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &mi);
+}
+
+static void AddMenuPopup(HMENU menu, HMENU sub, const wchar_t* text) {
+  MENUITEMINFOW mi{};
+  mi.cbSize = sizeof(mi);
+  mi.fMask = MIIM_SUBMENU | MIIM_FTYPE | MIIM_DATA | MIIM_STRING;
+  mi.fType = MFT_OWNERDRAW;
+  mi.hSubMenu = sub;
+  mi.dwTypeData = const_cast<LPWSTR>(text);
+  mi.cch = (UINT)wcslen(text);
+  mi.dwItemData = (ULONG_PTR)text;
+  InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &mi);
+}
+
 static HMENU CreateAppMenu() {
   HMENU hMenubar = CreateMenu();
   HMENU hFile = CreatePopupMenu();
   HMENU hHelp = CreatePopupMenu();
   HMENU hAppRoute = CreatePopupMenu();
 
-  AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT, L"E&xit");
+  AddMenuItem(hFile, IDM_FILE_EXIT, L"Exit");
 
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_OPEN_CHROME, L"Open Chrome (proxied)");
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_OPEN_EDGE, L"Open Edge (proxied)");
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_OPEN_FIREFOX, L"Open Firefox (proxied)");
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_OPEN_RUNELITE, L"Open RuneLite (proxied)");
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_OPEN_JAGEX, L"Open Jagex + RuneLite wrap");
-  AppendMenuW(hAppRoute, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_SET_CHROME, L"Set Chrome path...");
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_CLEAR_CHROME, L"Reset Chrome path (auto-detect)");
-  AppendMenuW(hAppRoute, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(hAppRoute, MF_STRING, IDM_HELP_APPROUTE, L"About app routing");
+  AddMenuItem(hAppRoute, IDM_HELP_OPEN_CHROME, L"Open Chrome (proxied)");
+  AddMenuItem(hAppRoute, IDM_HELP_OPEN_EDGE, L"Open Edge (proxied)");
+  AddMenuItem(hAppRoute, IDM_HELP_OPEN_FIREFOX, L"Open Firefox (proxied)");
+  AddMenuItem(hAppRoute, IDM_HELP_OPEN_RUNELITE, L"Open RuneLite (proxied)");
+  AddMenuItem(hAppRoute, IDM_HELP_OPEN_JAGEX, L"Open Jagex + RuneLite wrap");
+  AddMenuSep(hAppRoute);
+  AddMenuItem(hAppRoute, IDM_HELP_SET_CHROME, L"Set Chrome path...");
+  AddMenuItem(hAppRoute, IDM_HELP_CLEAR_CHROME, L"Reset Chrome path (auto-detect)");
+  AddMenuSep(hAppRoute);
+  AddMenuItem(hAppRoute, IDM_HELP_APPROUTE, L"About app routing");
 
-  AppendMenuW(hHelp, MF_STRING, IDM_HELP_UPDATE, L"Check for &Updates...");
-  AppendMenuW(hHelp, MF_STRING, IDM_HELP_WEBSITE, L"Visit &Website");
-  AppendMenuW(hHelp, MF_POPUP, (UINT_PTR)hAppRoute, L"App &routing");
-  AppendMenuW(hHelp, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(hHelp, MF_STRING, IDM_HELP_ABOUT, L"&About ProxyPiTester");
+  AddMenuItem(hHelp, IDM_HELP_UPDATE, L"Check for Updates...");
+  AddMenuItem(hHelp, IDM_HELP_WEBSITE, L"Visit Website");
+  AddMenuPopup(hHelp, hAppRoute, L"App routing");
+  AddMenuSep(hHelp);
+  AddMenuItem(hHelp, IDM_HELP_ABOUT, L"About ProxyPiTester");
 
-  AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hFile, L"&File");
-  AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hHelp, L"&Help");
+  AddMenuPopup(hMenubar, hFile, L"File");
+  AddMenuPopup(hMenubar, hHelp, L"Help");
   return hMenubar;
 }
 
@@ -2146,15 +2196,17 @@ struct BtnStyle {
   bool primary;
   bool hover;
   bool pressed;
+  bool enabled;
 };
 
 static BtnStyle GetBtnStyle(HWND hwnd) {
   BtnStyle s{};
   s.primary = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0);
+  s.enabled = IsWindowEnabled(hwnd) != FALSE;
   POINT pt; GetCursorPos(&pt);
   RECT rc; GetWindowRect(hwnd, &rc);
-  s.hover = PtInRect(&rc, pt) != 0;
-  s.pressed = (GetCapture() == hwnd) && s.hover;
+  s.hover = s.enabled && PtInRect(&rc, pt) != 0;
+  s.pressed = s.enabled && (GetCapture() == hwnd) && s.hover;
   return s;
 }
 
@@ -2165,36 +2217,54 @@ static LRESULT CALLBACK BtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       PAINTSTRUCT ps;
       HDC hdc = BeginPaint(hwnd, &ps);
       RECT rc; GetClientRect(hwnd, &rc);
-      BtnStyle st = GetBtnStyle(hwnd);
 
+      HDC mem = CreateCompatibleDC(hdc);
+      HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+      HGDIOBJ oldBmp = SelectObject(mem, bmp);
+
+      // Corners sit on a card, so match that fill before the rounded face.
+      HBRUSH cardBr = CreateSolidBrush(COL_CARD);
+      FillRect(mem, &rc, cardBr);
+      DeleteObject(cardBr);
+
+      BtnStyle st = GetBtnStyle(hwnd);
       COLORREF fill, border, text;
-      if (st.primary) {
+      if (!st.enabled) {
+        fill = RGB(22, 30, 46);
+        border = RGB(38, 50, 68);
+        text = RGB(100, 116, 139);
+      } else if (st.primary) {
         fill = st.pressed ? COL_PRIMARY_DD : (st.hover ? COL_PRIMARY_D : COL_PRIMARY);
         border = fill;
-        text = RGB(255, 255, 255);
+        text = COL_ON_PRIMARY;
       } else {
-        fill = st.pressed ? RGB(30, 41, 59) : (st.hover ? RGB(30, 41, 59) : COL_CARD);
+        fill = st.pressed ? RGB(28, 40, 60) : (st.hover ? RGB(26, 38, 58) : COL_CARD);
         border = st.hover ? COL_PRIMARY : COL_BORDER;
-        text = COL_TEXT;
+        text = st.hover ? COL_TEXT : COL_TEXT_BODY;
       }
 
+      int radius = 8;
       HBRUSH br = CreateSolidBrush(fill);
       HPEN pen = CreatePen(PS_SOLID, 1, border);
-      HGDIOBJ oldBr = SelectObject(hdc, br);
-      HGDIOBJ oldPen = SelectObject(hdc, pen);
-      RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
-      SelectObject(hdc, oldBr);
-      SelectObject(hdc, oldPen);
+      HGDIOBJ oldBr = SelectObject(mem, br);
+      HGDIOBJ oldPen = SelectObject(mem, pen);
+      RoundRect(mem, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+      SelectObject(mem, oldBr);
+      SelectObject(mem, oldPen);
       DeleteObject(br);
       DeleteObject(pen);
 
       wchar_t caption[128];
       GetWindowTextW(hwnd, caption, 128);
-      SetBkMode(hdc, TRANSPARENT);
-      SetTextColor(hdc, text);
-      SelectObject(hdc, hFontUi);
-      DrawTextW(hdc, caption, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      SetBkMode(mem, TRANSPARENT);
+      SetTextColor(mem, text);
+      SelectObject(mem, hFontBtn ? hFontBtn : hFontUi);
+      DrawTextW(mem, caption, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
+      BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+      SelectObject(mem, oldBmp);
+      DeleteObject(bmp);
+      DeleteDC(mem);
       EndPaint(hwnd, &ps);
       return 0;
     }
@@ -2206,6 +2276,12 @@ static LRESULT CALLBACK BtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     case WM_MOUSELEAVE:
       InvalidateRect(hwnd, nullptr, FALSE);
+      break;
+    case WM_SETCURSOR:
+      if (IsWindowEnabled(hwnd)) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+      }
       break;
     case WM_LBUTTONDOWN:
       SetCapture(hwnd);
@@ -2222,10 +2298,204 @@ static LRESULT CALLBACK BtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
       InvalidateRect(hwnd, nullptr, FALSE);
       break;
+    case WM_ENABLE:
+      InvalidateRect(hwnd, nullptr, FALSE);
+      break;
     case WM_ERASEBKGND:
       return 1;
   }
   return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Recolour the 1px system border on edits and lists. Scrollbars stay themed.
+static LRESULT CALLBACK FieldFrameProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                       UINT_PTR, DWORD_PTR) {
+  if (msg == WM_NCPAINT || msg == WM_NCACTIVATE) {
+    LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+    HDC hdc = GetWindowDC(hwnd);
+    if (hdc) {
+      RECT rc{};
+      GetWindowRect(hwnd, &rc);
+      OffsetRect(&rc, -rc.left, -rc.top);
+      bool hot = (GetFocus() == hwnd);
+      HBRUSH edge = CreateSolidBrush(hot ? COL_PRIMARY : COL_FIELD_LINE);
+      FrameRect(hdc, &rc, edge);
+      DeleteObject(edge);
+      ReleaseDC(hwnd, hdc);
+    }
+    return lr;
+  }
+  if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
+    LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+    return lr;
+  }
+  return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Closed combo face. The drop-down list is a separate window and keeps working.
+static LRESULT CALLBACK ComboProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                  UINT_PTR, DWORD_PTR) {
+  switch (msg) {
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC hdc = BeginPaint(hwnd, &ps);
+      RECT rc; GetClientRect(hwnd, &rc);
+      int itemH = (int)SendMessageW(hwnd, CB_GETITEMHEIGHT, (WPARAM)-1, 0);
+      if (itemH < 16) itemH = rc.bottom;
+      if (itemH > rc.bottom) itemH = rc.bottom;
+      RECT vis{ 0, 0, rc.right, itemH };
+
+      HBRUSH br = CreateSolidBrush(COL_BG_DEEP);
+      FillRect(hdc, &vis, br);
+      DeleteObject(br);
+      bool hot = (GetFocus() == hwnd);
+      HBRUSH edge = CreateSolidBrush(hot ? COL_PRIMARY : COL_FIELD_LINE);
+      FrameRect(hdc, &vis, edge);
+      DeleteObject(edge);
+
+      wchar_t buf[260] = L"";
+      int sel = (int)SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
+      if (sel >= 0)
+        SendMessageW(hwnd, CB_GETLBTEXT, sel, (LPARAM)buf);
+      RECT tr = vis;
+      tr.left += 10;
+      tr.right -= 26;
+      SetBkMode(hdc, TRANSPARENT);
+      SetTextColor(hdc, COL_TEXT);
+      SelectObject(hdc, hFontUi);
+      DrawTextW(hdc, buf, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+      int cx = vis.right - 14;
+      int cy = (vis.top + vis.bottom) / 2;
+      HPEN pen = CreatePen(PS_SOLID, 2, hot ? COL_PRIMARY : COL_TEXT_DIM);
+      HGDIOBJ oldPen = SelectObject(hdc, pen);
+      MoveToEx(hdc, cx - 4, cy - 2, nullptr);
+      LineTo(hdc, cx, cy + 3);
+      LineTo(hdc, cx + 4, cy - 2);
+      SelectObject(hdc, oldPen);
+      DeleteObject(pen);
+
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_CTLCOLORLISTBOX: {
+      HDC ldc = (HDC)wParam;
+      SetTextColor(ldc, COL_TEXT);
+      SetBkColor(ldc, COL_BG_DEEP);
+      return (LRESULT)hBrushInput;
+    }
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_COMMAND:
+      InvalidateRect(hwnd, nullptr, FALSE);
+      break;
+  }
+  return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK CheckProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                  UINT_PTR, DWORD_PTR) {
+  if (msg == WM_PAINT) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT rc; GetClientRect(hwnd, &rc);
+    HBRUSH br = CreateSolidBrush(COL_CARD);
+    FillRect(hdc, &rc, br);
+    DeleteObject(br);
+
+    bool checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    POINT pt; GetCursorPos(&pt);
+    RECT wr; GetWindowRect(hwnd, &wr);
+    bool hover = PtInRect(&wr, pt) != 0;
+
+    const int box = 15;
+    int y = (rc.bottom - box) / 2;
+    if (y < 0) y = 0;
+    RECT boxRc{ 1, y, 1 + box, y + box };
+    if (checked) {
+      HBRUSH fb = CreateSolidBrush(COL_PRIMARY);
+      HPEN fp = CreatePen(PS_SOLID, 1, COL_PRIMARY);
+      HGDIOBJ ob = SelectObject(hdc, fb);
+      HGDIOBJ op = SelectObject(hdc, fp);
+      RoundRect(hdc, boxRc.left, boxRc.top, boxRc.right, boxRc.bottom, 4, 4);
+      SelectObject(hdc, ob);
+      SelectObject(hdc, op);
+      DeleteObject(fb);
+      DeleteObject(fp);
+      HPEN mark = CreatePen(PS_SOLID, 2, COL_ON_PRIMARY);
+      HGDIOBJ om = SelectObject(hdc, mark);
+      int x0 = boxRc.left;
+      int y0 = boxRc.top;
+      MoveToEx(hdc, x0 + 3, y0 + 8, nullptr);
+      LineTo(hdc, x0 + 6, y0 + 11);
+      LineTo(hdc, x0 + 12, y0 + 4);
+      SelectObject(hdc, om);
+      DeleteObject(mark);
+    } else {
+      HBRUSH fb = CreateSolidBrush(COL_BG_DEEP);
+      HPEN fp = CreatePen(PS_SOLID, 1, hover ? COL_PRIMARY : COL_FIELD_LINE);
+      HGDIOBJ ob = SelectObject(hdc, fb);
+      HGDIOBJ op = SelectObject(hdc, fp);
+      RoundRect(hdc, boxRc.left, boxRc.top, boxRc.right, boxRc.bottom, 4, 4);
+      SelectObject(hdc, ob);
+      SelectObject(hdc, op);
+      DeleteObject(fb);
+      DeleteObject(fp);
+    }
+
+    wchar_t cap[160] = L"";
+    GetWindowTextW(hwnd, cap, 160);
+    const wchar_t* shown = cap;
+    while (*shown == L' ') ++shown;
+    if (shown[0]) {
+      RECT tr{ box + 8, 0, rc.right, rc.bottom };
+      SetBkMode(hdc, TRANSPARENT);
+      SetTextColor(hdc, hover ? COL_TEXT : COL_TEXT_BODY);
+      SelectObject(hdc, hFontSmall);
+      DrawTextW(hdc, shown, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    EndPaint(hwnd, &ps);
+    return 0;
+  }
+  if (msg == WM_ERASEBKGND) return 1;
+  if (msg == WM_MOUSEMOVE) {
+    TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+    TrackMouseEvent(&tme);
+    InvalidateRect(hwnd, nullptr, FALSE);
+  } else if (msg == WM_MOUSELEAVE || msg == BM_SETCHECK || msg == WM_LBUTTONUP) {
+    LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return lr;
+  }
+  return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+static void AllowDarkWindow(HWND hwnd);
+
+static void StyleEdit(HWND h, bool multiline) {
+  if (!h) return;
+  SendMessageW(h, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(8, 8));
+  // Dark scrollbars on the log; single-line fields have no scrollbar.
+  AllowDarkWindow(h);
+  SetWindowTheme(h, multiline ? L"DarkMode_Explorer" : L"", L"");
+  SetWindowSubclass(h, FieldFrameProc, 2, 0);
+}
+
+static void StyleCombo(HWND h) {
+  if (!h) return;
+  SetWindowTheme(h, L"", L"");
+  SendMessageW(h, CB_SETITEMHEIGHT, (WPARAM)-1, 26);
+  SendMessageW(h, CB_SETITEMHEIGHT, 0, 24);
+  SetWindowSubclass(h, ComboProc, 3, 0);
+}
+
+static void StyleCheck(HWND h) {
+  if (!h) return;
+  SetWindowTheme(h, L"", L"");
+  SetWindowSubclass(h, CheckProc, 4, 0);
 }
 
 static HWND CreateStyledButton(HWND parent, const wchar_t* text, int x, int y, int w, int h,
@@ -2249,11 +2519,11 @@ static HBRUSH OnCtlColorEdit(HDC hdc) {
 static HBRUSH OnCtlColorStatic(HDC hdc, HWND hwnd) {
   if (hwnd == hStatus) {
     SetTextColor(hdc, g_statusColor);
-    SetBkColor(hdc, COL_BG);
-    return hBrushBg;
+    SetBkColor(hdc, COL_CARD);
+    return hBrushCard ? hBrushCard : hBrushBg;
   }
   // Field labels + Remember me sit on painted cards (COL_CARD)
-  SetTextColor(hdc, COL_TEXT_DIM);
+  SetTextColor(hdc, COL_TEXT_BODY);
   SetBkColor(hdc, COL_CARD);
   SetBkMode(hdc, TRANSPARENT);
   return hBrushCard ? hBrushCard : hBrushBg;
@@ -2323,6 +2593,21 @@ static void FillRoundRect(HDC hdc, RECT rc, int radius, COLORREF fill, COLORREF 
   DeleteObject(pen);
 }
 
+// Short rounded section marker. Height matches the section label, not the card.
+static void PaintAccentBar(HDC hdc, int x, int y, int w, int h, COLORREF color) {
+  if (w < 1 || h < 1) return;
+  HBRUSH br = CreateSolidBrush(color);
+  HPEN pen = CreatePen(PS_SOLID, 1, color);
+  HGDIOBJ oldBr = SelectObject(hdc, br);
+  HGDIOBJ oldPen = SelectObject(hdc, pen);
+  int r = (w < h ? w : h);
+  RoundRect(hdc, x, y, x + w, y + h, r, r);
+  SelectObject(hdc, oldBr);
+  SelectObject(hdc, oldPen);
+  DeleteObject(br);
+  DeleteObject(pen);
+}
+
 static void DrawTextAt(HDC hdc, const wchar_t* text, int x, int y, int w, COLORREF color, HFONT font, UINT flags = DT_LEFT) {
   RECT rc{ x, y, x + w, y + 40 };
   SelectObject(hdc, font);
@@ -2331,24 +2616,71 @@ static void DrawTextAt(HDC hdc, const wchar_t* text, int x, int y, int w, COLORR
   DrawTextW(hdc, text, -1, &rc, flags | DT_SINGLELINE | DT_NOPREFIX);
 }
 
-static void PaintHeader(HDC hdc, int width) {
-  // Dark gradient-ish header band
-  RECT top{ 0, 0, width, 110 };
-  HBRUSH br = CreateSolidBrush(COL_BG);
-  FillRect(hdc, &top, br);
-  DeleteObject(br);
+static void DrawTextBox(HDC hdc, const wchar_t* text, RECT rc, COLORREF color, HFONT font, UINT flags) {
+  SelectObject(hdc, font);
+  SetTextColor(hdc, color);
+  SetBkMode(hdc, TRANSPARENT);
+  DrawTextW(hdc, text, -1, &rc, flags | DT_NOPREFIX);
+}
 
-  // Accent bar
-  RECT bar{ 0, 0, width, 3 };
+static void FillGradientV(HDC hdc, RECT rc, COLORREF top, COLORREF bot) {
+  if (rc.right <= rc.left || rc.bottom <= rc.top) return;
+  TRIVERTEX v[2]{};
+  v[0].x = rc.left;
+  v[0].y = rc.top;
+  v[0].Red = (COLOR16)(GetRValue(top) << 8);
+  v[0].Green = (COLOR16)(GetGValue(top) << 8);
+  v[0].Blue = (COLOR16)(GetBValue(top) << 8);
+  v[1].x = rc.right;
+  v[1].y = rc.bottom;
+  v[1].Red = (COLOR16)(GetRValue(bot) << 8);
+  v[1].Green = (COLOR16)(GetGValue(bot) << 8);
+  v[1].Blue = (COLOR16)(GetBValue(bot) << 8);
+  GRADIENT_RECT g{ 0, 1 };
+  GradientFill(hdc, v, 2, &g, 1, GRADIENT_FILL_RECT_V);
+}
+
+static void PaintHeader(HDC hdc, int width) {
+  RECT top{ 0, 0, width, 100 };
+  FillGradientV(hdc, top, RGB(14, 28, 46), COL_BG);
+
+  RECT bar{ 0, 0, width, 2 };
   HBRUSH brBar = CreateSolidBrush(COL_PRIMARY);
   FillRect(hdc, &bar, brBar);
   DeleteObject(brBar);
 
-  // Soft glow ellipse (approximation with solid alpha-ish circle via layered fill)
-  // Title
-  DrawTextAt(hdc, L"ProxyPiTester", PAD, 22, 360, COL_PRIMARY, hFontTitle);
-  DrawTextAt(hdc, L"UK residential proxy test & app routing", PAD, 58, 420, COL_TEXT_DIM, hFontSmall);
-  DrawTextAt(hdc, L"proxypi.co.uk", width - PAD - 140, 28, 140, COL_TEXT_DIM, hFontSmall, DT_RIGHT);
+  const int iconSz = HEADER_ICON_PX;
+  const int iconX = PAD;
+  const int iconY = 18;
+  if (g_headerIcon) {
+    DrawIconEx(hdc, iconX, iconY, g_headerIcon, iconSz, iconSz, 0, nullptr, DI_NORMAL);
+  } else {
+    RECT mark{ iconX, iconY, iconX + iconSz, iconY + iconSz };
+    FillRoundRect(hdc, mark, 12, COL_PRIMARY, COL_PRIMARY);
+    DrawTextBox(hdc, L"Pi", mark, COL_ON_PRIMARY, hFontBtn ? hFontBtn : hFontUi,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  }
+
+  int textX = iconX + iconSz + 14;
+  SelectObject(hdc, hFontTitle);
+  SIZE brandSz{};
+  GetTextExtentPoint32W(hdc, L"ProxyPi", 7, &brandSz);
+  DrawTextAt(hdc, L"ProxyPi", textX, 20, brandSz.cx + 4, COL_TEXT, hFontTitle);
+  DrawTextAt(hdc, L"Tester", textX + brandSz.cx + 8, 20, 140, COL_PRIMARY, hFontTitle);
+  DrawTextAt(hdc, L"UK residential proxy test and app routing", textX, 52, 460, COL_TEXT_DIM, hFontSmall);
+
+  int right = width - PAD;
+  if (right > textX + 220) {
+    std::wstring ver = L"v";
+    ver += APP_VERSION;
+    DrawTextAt(hdc, ver.c_str(), right - 140, 28, 140, COL_TEXT, hFontSmall, DT_RIGHT);
+    DrawTextAt(hdc, L"proxypi.co.uk", right - 160, 50, 160, COL_TEXT_DIM, hFontSmall, DT_RIGHT);
+  }
+
+  RECT rule{ 0, 99, width, 100 };
+  HBRUSH ruleBr = CreateSolidBrush(COL_BORDER);
+  FillRect(hdc, &rule, ruleBr);
+  DeleteObject(ruleBr);
 }
 
 static void PaintMetricCards(HDC hdc, int y) {
@@ -2359,9 +2691,12 @@ static void PaintMetricCards(HDC hdc, int y) {
 
   auto paintOne = [&](int x, const wchar_t* label, const std::wstring& value, COLORREF valueColor) {
     RECT rc{ x, y, x + w3, y + cardH };
-    FillRoundRect(hdc, rc, 12, COL_CARD, COL_BORDER);
-    DrawTextAt(hdc, label, x + 14, y + 8, w3 - 28, COL_TEXT_DIM, hFontSmall);
-    DrawTextAt(hdc, value.c_str(), x + 14, y + (cardH >= 64 ? 30 : 26), w3 - 28, valueColor, hFontUi);
+    FillRoundRect(hdc, rc, 14, COL_CARD, COL_CARD_LINE);
+    COLORREF accentCol = valueColor == COL_TEXT_DIM ? COL_BORDER : valueColor;
+    PaintAccentBar(hdc, x + 16, y + 16, 4, 28, accentCol);
+    DrawTextAt(hdc, label, x + 28, y + 8, w3 - 40, COL_TEXT_DIM, hFontSection ? hFontSection : hFontSmall);
+    DrawTextAt(hdc, value.c_str(), x + 28, y + (cardH >= 64 ? 30 : 26), w3 - 40, valueColor,
+               hFontMetric ? hFontMetric : hFontUi, DT_LEFT | DT_END_ELLIPSIS);
   };
 
   std::wstring lat = g_hasResult ? (std::to_wstring(g_lastLatency) + L" ms") : L"-";
@@ -2381,14 +2716,24 @@ static void PaintMetricCards(HDC hdc, int y) {
 
 static void PaintCardChrome(HDC hdc, RECT rc, const wchar_t* title) {
   if (rc.bottom <= rc.top + 8 || rc.right <= rc.left + 8) return;
-  FillRoundRect(hdc, rc, 14, COL_CARD, COL_BORDER);
-  DrawTextAt(hdc, title, rc.left + 16, rc.top + 10, rc.right - rc.left - 32, COL_PRIMARY, hFontSmall);
+  FillRoundRect(hdc, rc, 16, COL_CARD, COL_CARD_LINE);
+  // Marker matches the section-label cap and stays inside the corner radius.
+  const int titleTop = rc.top + 8;
+  const int titleH = 20;
+  const int barH = 14;
+  const int barW = 4;
+  const int barX = rc.left + 18;
+  const int barY = titleTop + (titleH - barH) / 2;
+  PaintAccentBar(hdc, barX, barY, barW, barH, COL_PRIMARY);
+  RECT titleRc{ barX + barW + 8, titleTop, rc.right - 16, titleTop + titleH };
+  DrawTextBox(hdc, title, titleRc, COL_TEXT_BODY, hFontSection ? hFontSection : hFontSmall,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 // Place control at document (x,y); converts to screen using g_lay.scrollY
 static void MoveCtrl(HWND h, int x, int y, int w, int hh) {
   if (h && IsWindow(h))
-    SetWindowPos(h, nullptr, x, y - g_lay.scrollY, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(h, nullptr, x, y - g_lay.scrollY + MENU_STRIP_H, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void HideCtrl(HWND h) {
@@ -2425,7 +2770,8 @@ static void SetScrollY(HWND hwnd, int newY) {
   if (newY == g_lay.scrollY) return;
   int dy = g_lay.scrollY - newY; // positive = content moves down on screen
   g_lay.scrollY = newY;
-  ScrollWindowEx(hwnd, 0, dy, nullptr, nullptr, nullptr, nullptr,
+  RECT clip{ 0, MENU_STRIP_H, g_lay.clientW, MENU_STRIP_H + g_lay.clientH };
+  ScrollWindowEx(hwnd, 0, dy, nullptr, &clip, nullptr, nullptr,
                  SW_INVALIDATE | SW_ERASE | SW_SCROLLCHILDREN);
   SCROLLINFO si{};
   si.cbSize = sizeof(si);
@@ -2484,15 +2830,15 @@ static void ApplyLayout(HWND hwnd) {
     RECT rc{};
     GetClientRect(hwnd, &rc);
     int cw = rc.right - rc.left;
-    int ch = rc.bottom - rc.top;
+    int ch = rc.bottom - rc.top - MENU_STRIP_H;
     if (cw < 100) cw = 100;
     if (ch < 100) ch = 100;
 
     SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
 
     const int outerPad = (cw < 760) ? 12 : 20;
-    const int gap = 12;
-    const int headerEnd = 100;
+    const int gap = 16;
+    const int headerEnd = 116;
     const int footerBand = 72; // status + branding (document space)
     const int labelW = 72;
     const int rowH = 28;
@@ -2508,8 +2854,8 @@ static void ApplyLayout(HWND hwnd) {
     const bool narrow = g_lay.narrow;
 
     // Always use comfortable sizes — never squash top half for short windows
-    const int acctCardH = 198;
-    const int cfgCardH  = 218;
+    const int acctCardH = 206;
+    const int cfgCardH  = 232;
     g_lay.metricsH = 72;
 
     // ---- Account + Config cards ----
@@ -2536,12 +2882,12 @@ static void ApplyLayout(HWND hwnd) {
     }
 
     auto layoutFields = [&](int left, int top, int cardW, bool account) {
-      int pad = 12;
+      int pad = 16;
       int labelX = left + pad;
       int fieldX = left + pad + labelW;
       int fieldW = cardW - pad * 2 - labelW;
       if (fieldW < 80) fieldW = 80;
-      int y = top + 32;
+      int y = top + 36;
       if (account) {
         MoveCtrl(hLblAcctEmail, labelX, y + 4, labelW, 18);
         MoveCtrl(hAcctEmail, fieldX, y, fieldW, rowH);
@@ -2619,8 +2965,8 @@ static void ApplyLayout(HWND hwnd) {
 
     // ---- ACTIVE APPS: natural toolbar, then list/results ----
     g_lay.routeTop = yCursor;
-    const int rx = g_lay.cardX + 12;
-    const int rRight = g_lay.cardX + g_lay.cardW - 12;
+    const int rx = g_lay.cardX + 16;
+    const int rRight = g_lay.cardX + g_lay.cardW - 16;
     const int rw = rRight - rx;
     const int gapCards = gap;
 
@@ -2703,16 +3049,16 @@ static void ApplyLayout(HWND hwnd) {
     if (g_lay.scrollY > maxY) g_lay.scrollY = maxY;
     if (g_lay.scrollY < 0) g_lay.scrollY = 0;
 
-    int sessH = g_lay.routeBot - sessTop - 8;
+    int sessH = g_lay.routeBot - sessTop - 16;
     if (sessH < 24) sessH = 24;
     MoveCtrl(hSessionList, rx, sessTop, rw, sessH);
 
-    int resInnerTop = g_lay.resTop + 26;
-    int resInnerH = g_lay.resBot - resInnerTop - 8;
+    int resInnerTop = g_lay.resTop + 32;
+    int resInnerH = g_lay.resBot - resInnerTop - 16;
     if (resInnerH < 20) resInnerH = 20;
     MoveCtrl(hResult, rx, resInnerTop, rw, resInnerH);
 
-    MoveCtrl(hStatus, g_lay.cardX + 8, g_lay.statusY + 6, g_lay.cardW - 16, 26);
+    MoveCtrl(hStatus, g_lay.cardX + 28, g_lay.statusY + 6, g_lay.cardW - 40, 26);
 
     UpdateScrollBar(hwnd);
 
@@ -2721,7 +3067,7 @@ static void ApplyLayout(HWND hwnd) {
     // If scrollbar toggle changed client size, re-measure once
     RECT rc2{};
     GetClientRect(hwnd, &rc2);
-    if (rc2.right - rc2.left == cw && rc2.bottom - rc2.top == ch)
+    if (rc2.right - rc2.left == cw && rc2.bottom - rc2.top == ch + MENU_STRIP_H)
       break;
   }
 
@@ -2731,29 +3077,62 @@ static void ApplyLayout(HWND hwnd) {
 }
 
 // ---- window proc ----
+static LRESULT HandleMenuBarPaint(HWND hwnd, UINT msg, LPARAM lParam);
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
+    case 0x0091: // WM_UAHDRAWMENU
+    case 0x0092: // WM_UAHDRAWMENUITEM
+      return HandleMenuBarPaint(hwnd, msg, lParam);
+
     case WM_CREATE: {
       hMain = hwnd;
 
-      // Fonts — Inter if installed, else Segoe UI
-      hFontTitle = CreateFontW(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+      // Negative height is the character size in pixels. Segoe UI is on every supported Windows.
+      hFontTitle = CreateFontW(-24, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-      hFontUi = CreateFontW(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+      hFontUi = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-      hFontSmall = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+      hFontBtn = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-      hFontMono = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+      hFontSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        FIXED_PITCH | FF_MODERN, L"Consolas");
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+      hFontSection = CreateFontW(-11, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+      hFontMetric = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+      hFontMono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
+      {
+        HDC dc = GetDC(hwnd);
+        HFONT prev = (HFONT)SelectObject(dc, hFontMono);
+        wchar_t face[64] = L"";
+        GetTextFaceW(dc, 64, face);
+        SelectObject(dc, prev);
+        ReleaseDC(hwnd, dc);
+        if (_wcsicmp(face, L"Cascadia Mono") != 0) {
+          DeleteObject(hFontMono);
+          hFontMono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+            FIXED_PITCH | FF_MODERN, L"Consolas");
+        }
+      }
 
       hBrushBg = CreateSolidBrush(COL_BG);
       hBrushCard = CreateSolidBrush(COL_CARD);
       hBrushInput = CreateSolidBrush(COL_BG_DEEP);
       hBrushPrimary = CreateSolidBrush(COL_PRIMARY);
+      if (!g_headerIcon) {
+        g_headerIcon = (HICON)LoadImageW((HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE),
+          MAKEINTRESOURCEW(101), IMAGE_ICON, HEADER_ICON_PX, HEADER_ICON_PX, LR_DEFAULTCOLOR);
+      }
 
       // Controls created at placeholder coords; ApplyLayout positions everything.
       auto mkLabel = [&](const wchar_t* t) {
@@ -2768,19 +3147,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_ACCT_EMAIL, nullptr, nullptr);
       SendMessageW(hAcctEmail, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hAcctEmail, false);
+      SendMessageW(hAcctEmail, EM_SETCUEBANNER, TRUE, (LPARAM)L"you@email.com");
 
       hLblAcctPass = mkLabel(L"Password");
       hAcctPass = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_ACCT_PASS, nullptr, nullptr);
       SendMessageW(hAcctPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hAcctPass, false);
 
       // Empty text on checkbox; label is a STATIC so colour matches Email/Password
       hCheckRemember = CreateWindowW(L"BUTTON", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         0, 0, 20, 20, hwnd, (HMENU)ID_CHECK_REMEMBER, nullptr, nullptr);
-      // Disable visual styles so dark-theme colours apply cleanly to the box
-      SetWindowTheme(hCheckRemember, L"", L"");
+      StyleCheck(hCheckRemember);
       hLblRemember = CreateWindowW(L"STATIC", L"Remember me",
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
         0, 0, 160, 18, hwnd, nullptr, nullptr, nullptr);
@@ -2798,23 +3179,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       SendMessageW(hComboType, CB_ADDSTRING, 0, (LPARAM)L"HTTP / HTTPS");
       SendMessageW(hComboType, CB_SETCURSEL, 0, 0);
       SendMessageW(hComboType, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleCombo(hComboType);
 
       hLblHost = mkLabel(L"Host");
       hHost = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_HOST, nullptr, nullptr);
       SendMessageW(hHost, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hHost, false);
+      SendMessageW(hHost, EM_SETCUEBANNER, TRUE, (LPARAM)L"proxy host");
 
       hLblPort = mkLabel(L"Port");
       hPort = CreateWindowW(L"EDIT", L"18721",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_PORT, nullptr, nullptr);
       SendMessageW(hPort, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hPort, false);
 
       hCheckAuth = CreateWindowW(L"BUTTON", L" Authentication",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         0, 0, 160, 24, hwnd, (HMENU)ID_CHECK_AUTH, nullptr, nullptr);
-      SetWindowTheme(hCheckAuth, L"", L"");
+      StyleCheck(hCheckAuth);
       SendMessageW(hCheckAuth, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
       SendMessageW(hCheckAuth, BM_SETCHECK, BST_CHECKED, 0);
 
@@ -2823,12 +3208,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_USER, nullptr, nullptr);
       SendMessageW(hUser, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hUser, false);
+      SendMessageW(hUser, EM_SETCUEBANNER, TRUE, (LPARAM)L"proxy username");
 
       hLblPass = mkLabel(L"Password");
       hPass = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | ES_PASSWORD,
         0, 0, 100, 32, hwnd, (HMENU)ID_EDIT_PASS, nullptr, nullptr);
       SendMessageW(hPass, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hPass, false);
 
       hBtnTest = CreateStyledButton(hwnd, L"Test Proxy", 0, 0, 100, 42, ID_BTN_TEST, true);
       hBtnSpeed = CreateStyledButton(hwnd, L"Speed Test", 0, 0, 100, 42, ID_BTN_SPEED, true);
@@ -2846,6 +3234,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
         0, 0, COMBO_APPS_W, 200, hwnd, (HMENU)ID_COMBO_APPS, nullptr, nullptr);
       SendMessageW(hComboApps, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleCombo(hComboApps);
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Chrome");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Edge");
       SendMessageW(hComboApps, CB_ADDSTRING, 0, (LPARAM)L"Brave");
@@ -2873,6 +3262,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
         0, 0, 200, 28, hwnd, (HMENU)ID_EDIT_OPEN_URL, nullptr, nullptr);
       SendMessageW(hEditOpenUrl, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleEdit(hEditOpenUrl, false);
       hBtnOpenUrl = CreateStyledButton(hwnd, L"Open URL", 0, 0, BTN_URL_W, 32, ID_BTN_OPEN_URL, true);
       hBtnCopyIp = CreateStyledButton(hwnd, L"Copy IP", 0, 0, BTN_COPY_W, 32, ID_BTN_COPY_IP, false);
       hBtnCopyReport = CreateStyledButton(hwnd, L"Report", 0, 0, 88, 30, ID_BTN_COPY_REPORT, false);
@@ -2883,13 +3273,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
         0, 0, 160, 200, hwnd, (HMENU)ID_COMBO_PROFILE, nullptr, nullptr);
       SendMessageW(hComboProfile, WM_SETFONT, (WPARAM)hFontUi, TRUE);
+      StyleCombo(hComboProfile);
       hBtnSaveProfile = CreateStyledButton(hwnd, L"Save", 0, 0, 70, 28, ID_BTN_SAVE_PROFILE, false);
       hBtnRunProfile = CreateStyledButton(hwnd, L"Run", 0, 0, 70, 28, ID_BTN_RUN_PROFILE, true);
       hBtnDelProfile = CreateStyledButton(hwnd, L"Delete", 0, 0, 70, 28, ID_BTN_DEL_PROFILE, false);
       hCheckTray = CreateWindowW(L"BUTTON", L" Minimize to tray",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
         0, 0, 160, 22, hwnd, (HMENU)ID_CHECK_TRAY, nullptr, nullptr);
-      SetWindowTheme(hCheckTray, L"", L"");
+      StyleCheck(hCheckTray);
       SendMessageW(hCheckTray, WM_SETFONT, (WPARAM)hFontSmall, TRUE);
       // Default unchecked — tray hide looks like a crash to many users
       SendMessageW(hCheckTray, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -2908,11 +3299,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
         0, 0, 100, 80, hwnd, (HMENU)ID_LIST_SESSIONS, nullptr, nullptr);
       SendMessageW(hSessionList, WM_SETFONT, (WPARAM)hFontMono, TRUE);
+      AllowDarkWindow(hSessionList);
+      SetWindowTheme(hSessionList, L"DarkMode_Explorer", nullptr);
+      SetWindowSubclass(hSessionList, FieldFrameProc, 2, 0);
 
       hResult = CreateWindowW(L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
         0, 0, 100, 60, hwnd, (HMENU)ID_EDIT_RESULT, nullptr, nullptr);
       SendMessageW(hResult, WM_SETFONT, (WPARAM)hFontMono, TRUE);
+      StyleEdit(hResult, true);
 
       hStatus = CreateWindowW(L"STATIC", g_statusText.c_str(),
         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS,
@@ -3035,8 +3430,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       FillRect(mem, &client, bg);
       DeleteObject(bg);
 
-      // g_lay Ys are document coords; shift origin so paint matches scrolled children
-      SetWindowOrgEx(mem, 0, g_lay.scrollY, nullptr);
+      // Document origin sits just under the fixed command strip.
+      SetWindowOrgEx(mem, 0, g_lay.scrollY - MENU_STRIP_H, nullptr);
 
       PaintHeader(mem, client.right);
 
@@ -3057,11 +3452,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       int statusTop = g_lay.statusY;
       if (statusTop < g_lay.resBot + 6) statusTop = g_lay.resBot + 6;
       RECT statusBg{ g_lay.cardX, statusTop, g_lay.cardX + g_lay.cardW, statusTop + 36 };
-      FillRoundRect(mem, statusBg, 10, COL_CARD, COL_BORDER);
+      FillRoundRect(mem, statusBg, 12, COL_CARD, COL_CARD_LINE);
+      PaintAccentBar(mem, g_lay.cardX + 16, statusTop + 11, 4, 14, g_statusColor);
 
-      // Footer branding — ASCII only, scrolls with content
       {
-        std::wstring foot = L"No logging | UK residential | Pay as you go | v";
+        std::wstring foot = L"No logging   ·   UK residential   ·   Pay as you go   ·   v";
         foot += APP_VERSION;
         RECT footRc{ 8, g_lay.footerY - 2, client.right - 8, g_lay.footerY + 18 };
         SelectObject(mem, hFontSmall);
@@ -3072,6 +3467,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       }
 
       SetWindowOrgEx(mem, 0, 0, nullptr);
+      {
+        RECT strip{ 0, 0, client.right, MENU_STRIP_H };
+        HBRUSH sb = CreateSolidBrush(RGB(10, 15, 26));
+        FillRect(mem, &strip, sb);
+        DeleteObject(sb);
+        RECT rule{ 0, MENU_STRIP_H - 1, client.right, MENU_STRIP_H };
+        HBRUSH rb = CreateSolidBrush(COL_BORDER);
+        FillRect(mem, &rule, rb);
+        DeleteObject(rb);
+        RECT fileRc{ 8, 2, 78, MENU_STRIP_H - 3 };
+        RECT helpRc{ 78, 2, 152, MENU_STRIP_H - 3 };
+        auto paintCmd = [&](RECT rc, const wchar_t* label, bool hot) {
+          if (hot) {
+            HBRUSH hb = CreateSolidBrush(RGB(24, 40, 62));
+            FillRect(mem, &rc, hb);
+            DeleteObject(hb);
+          }
+          DrawTextBox(mem, label, rc, hot ? COL_PRIMARY : COL_TEXT, hFontUi,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        };
+        paintCmd(fileRc, L"File", g_menuHot == 1);
+        paintCmd(helpRc, L"Help", g_menuHot == 2);
+      }
       BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
       SelectObject(mem, old);
       DeleteObject(bmp);
@@ -3138,9 +3556,126 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CTLCOLORBTN:
       return (LRESULT)OnCtlColorBtn((HDC)wParam);
 
-    case WM_DRAWITEM: {
-      // Owner-draw handled by subclass paint; ignore default
+    case WM_MEASUREITEM: {
+      auto* ms = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+      if (ms->CtlType != ODT_MENU) break;
+      const wchar_t* t = reinterpret_cast<const wchar_t*>(ms->itemData);
+      if (!t || !t[0]) {
+        ms->itemWidth = 200;
+        ms->itemHeight = 9;
+      } else {
+        HDC hdc = GetDC(hwnd);
+        HFONT old = (HFONT)SelectObject(hdc, hFontUi ? hFontUi : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, t, (int)wcslen(t), &sz);
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd, hdc);
+        ms->itemWidth = sz.cx + 56;
+        ms->itemHeight = 30;
+      }
       return TRUE;
+    }
+
+    case WM_DRAWITEM: {
+      auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+      if (dis->CtlType == ODT_MENU) {
+        const wchar_t* text = reinterpret_cast<const wchar_t*>(dis->itemData);
+        bool sep = (!text || !text[0]);
+        bool hot = !sep && (dis->itemState & ODS_SELECTED);
+        HBRUSH br = CreateSolidBrush(hot ? RGB(24, 40, 62) : RGB(12, 18, 30));
+        FillRect(dis->hDC, &dis->rcItem, br);
+        DeleteObject(br);
+        if (sep) {
+          int mid = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+          RECT line{ dis->rcItem.left + 12, mid, dis->rcItem.right - 12, mid + 1 };
+          HBRUSH lb = CreateSolidBrush(COL_BORDER);
+          FillRect(dis->hDC, &line, lb);
+          DeleteObject(lb);
+        } else {
+          bool hasSub = false;
+          if (dis->hwndItem) {
+            HMENU hm = reinterpret_cast<HMENU>(dis->hwndItem);
+            int n = GetMenuItemCount(hm);
+            for (int i = 0; i < n; ++i) {
+              MENUITEMINFOW info{};
+              info.cbSize = sizeof(info);
+              info.fMask = MIIM_DATA | MIIM_SUBMENU;
+              if (GetMenuItemInfoW(hm, (UINT)i, TRUE, &info) &&
+                  info.dwItemData == dis->itemData && info.hSubMenu) {
+                hasSub = true;
+                break;
+              }
+            }
+          }
+          SetBkMode(dis->hDC, TRANSPARENT);
+          SetTextColor(dis->hDC, hot ? COL_PRIMARY : COL_TEXT);
+          SelectObject(dis->hDC, hFontUi ? hFontUi : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+          RECT tr = dis->rcItem;
+          tr.left += 16;
+          tr.right -= hasSub ? 22 : 10;
+          DrawTextW(dis->hDC, text, -1, &tr,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+          if (hasSub) {
+            int cx = dis->rcItem.right - 14;
+            int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+            HPEN pen = CreatePen(PS_SOLID, 2, hot ? COL_PRIMARY : COL_TEXT_DIM);
+            HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
+            MoveToEx(dis->hDC, cx - 3, cy - 4, nullptr);
+            LineTo(dis->hDC, cx + 1, cy);
+            LineTo(dis->hDC, cx - 3, cy + 4);
+            SelectObject(dis->hDC, oldPen);
+            DeleteObject(pen);
+          }
+        }
+        return TRUE;
+      }
+      return TRUE;
+    }
+
+    case WM_MOUSEMOVE: {
+      POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+      int hot = 0;
+      if (pt.y >= 0 && pt.y < MENU_STRIP_H) {
+        if (pt.x >= 8 && pt.x < 78) hot = 1;
+        else if (pt.x >= 78 && pt.x < 152) hot = 2;
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+      }
+      if (hot != g_menuHot) {
+        g_menuHot = hot;
+        RECT r{ 0, 0, 220, MENU_STRIP_H };
+        InvalidateRect(hwnd, &r, FALSE);
+      }
+      if (hot) {
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+      }
+      return 0;
+    }
+
+    case WM_MOUSELEAVE:
+      if (g_menuHot) {
+        g_menuHot = 0;
+        RECT r{ 0, 0, 220, MENU_STRIP_H };
+        InvalidateRect(hwnd, &r, FALSE);
+      }
+      return 0;
+
+    case WM_LBUTTONDOWN: {
+      POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+      int which = 0;
+      if (pt.y >= 0 && pt.y < MENU_STRIP_H) {
+        if (pt.x >= 8 && pt.x < 78) which = 1;
+        else if (pt.x >= 78 && pt.x < 152) which = 2;
+      }
+      if (which && g_menuBar) {
+        HMENU sub = GetSubMenu(g_menuBar, which - 1);
+        POINT sp{ which == 1 ? 8 : 78, MENU_STRIP_H - 1 };
+        ClientToScreen(hwnd, &sp);
+        TrackPopupMenu(sub, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+                       sp.x, sp.y, 0, hwnd, nullptr);
+        return 0;
+      }
+      break;
     }
 
     case WM_COMMAND: {
@@ -3539,8 +4074,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO: {
       auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
       const DWORD style = WS_OVERLAPPEDWINDOW;
-      RECT want{ 0, 0, MIN_CLIENT_W, MIN_CLIENT_H };
-      AdjustWindowRectEx(&want, style, TRUE, 0);
+      RECT want{ 0, 0, MIN_CLIENT_W, MIN_CLIENT_H + MENU_STRIP_H };
+      AdjustWindowRectEx(&want, style, FALSE, 0);
       mmi->ptMinTrackSize.x = want.right - want.left;
       mmi->ptMinTrackSize.y = want.bottom - want.top;
       // No max size lock — allow maximize and free resize
@@ -3558,14 +4093,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       ClearRuneLiteSocksWrap(clearErr);
       ClearRoutedAppSessions();
       StopLocalAuthBridge();
+      if (g_menuBar) {
+        DestroyMenu(g_menuBar);
+        g_menuBar = nullptr;
+      }
       if (hFontTitle) DeleteObject(hFontTitle);
       if (hFontUi) DeleteObject(hFontUi);
+      if (hFontBtn) DeleteObject(hFontBtn);
       if (hFontSmall) DeleteObject(hFontSmall);
+      if (hFontSection) DeleteObject(hFontSection);
+      if (hFontMetric) DeleteObject(hFontMetric);
       if (hFontMono) DeleteObject(hFontMono);
       if (hBrushBg) DeleteObject(hBrushBg);
       if (hBrushCard) DeleteObject(hBrushCard);
       if (hBrushInput) DeleteObject(hBrushInput);
       if (hBrushPrimary) DeleteObject(hBrushPrimary);
+      if (g_headerIcon) {
+        DestroyIcon(g_headerIcon);
+        g_headerIcon = nullptr;
+      }
       PostQuitMessage(0);
       return 0;
     }
@@ -3629,10 +4175,139 @@ static LONG WINAPI ProxyPiUnhandledException(EXCEPTION_POINTERS* ep) {
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Immersive dark mode for the caption, menu bar, and scrollbars.
+// Ordinals are the supported-in-practice uxtheme entry points (Win10 1903+ / Win11).
+static void EnableDarkAppMode() {
+  HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+  if (!ux) return;
+  using FnSetPreferred = int (WINAPI*)(int);
+  using FnRefresh = void (WINAPI*)();
+  using FnFlush = void (WINAPI*)();
+  auto setPreferred = (FnSetPreferred)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+  auto refresh = (FnRefresh)GetProcAddress(ux, MAKEINTRESOURCEA(104));
+  auto flush = (FnFlush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+  if (setPreferred) setPreferred(2); // ForceDark
+  if (refresh) refresh();
+  if (flush) flush();
+}
+
+static void AllowDarkWindow(HWND hwnd) {
+  if (!hwnd) return;
+  HMODULE ux = GetModuleHandleW(L"uxtheme.dll");
+  if (!ux) ux = LoadLibraryW(L"uxtheme.dll");
+  if (!ux) return;
+  using FnAllow = BOOL (WINAPI*)(HWND, BOOL);
+  auto allow = (FnAllow)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+  if (allow) allow(hwnd, TRUE);
+}
+
+static void ApplyDarkFrame(HWND hwnd) {
+  if (!hwnd) return;
+  BOOL dark = TRUE;
+  DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark)); // DWMWA_USE_IMMERSIVE_DARK_MODE
+  DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark)); // older Win10 build
+  COLORREF caption = COL_BG;
+  COLORREF border = COL_BG;
+  COLORREF text = COL_TEXT;
+  DwmSetWindowAttribute(hwnd, 35, &caption, sizeof(caption)); // DWMWA_CAPTION_COLOR
+  DwmSetWindowAttribute(hwnd, 34, &border, sizeof(border));   // DWMWA_BORDER_COLOR
+  DwmSetWindowAttribute(hwnd, 36, &text, sizeof(text));       // DWMWA_TEXT_COLOR
+  int corner = 2; // DWMWCP_ROUND
+  DwmSetWindowAttribute(hwnd, 33, &corner, sizeof(corner));
+  AllowDarkWindow(hwnd);
+  SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
+  // Win11 composition flag. Darkens classic scrollbars when the OS honors it.
+  HMODULE user = GetModuleHandleW(L"user32.dll");
+  if (user) {
+    struct WcaData { DWORD attrib; PVOID data; SIZE_T size; };
+    using FnSet = BOOL (WINAPI*)(HWND, WcaData*);
+    auto setWca = (FnSet)GetProcAddress(user, "SetWindowCompositionAttribute");
+    BOOL darkColors = TRUE;
+    WcaData data{ 26, &darkColors, sizeof(darkColors) }; // WCA_USEDARKMODECOLORS
+    if (setWca) setWca(hwnd, &data);
+  }
+}
+
+// Themed menu bar ignores dark mode and stays white. These undocumented
+// messages are how the system asks the window to paint that strip.
+#ifndef WM_UAHDRAWMENU
+#define WM_UAHDRAWMENU 0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+#endif
+
+typedef union tagUAHMENUITEMMETRICS {
+  struct { DWORD cx; DWORD cy; } rgsizeBar[2];
+  struct { DWORD cx; DWORD cy; } rgsizePopup[4];
+} UAHMENUITEMMETRICS;
+
+typedef struct tagUAHMENUPOPUPMETRICS {
+  DWORD rgcx[4];
+  DWORD fUpdateMaxWidths : 2;
+} UAHMENUPOPUPMETRICS;
+
+typedef struct tagUAHMENU {
+  HMENU hmenu;
+  HDC hdc;
+  DWORD dwFlags;
+} UAHMENU;
+
+typedef struct tagUAHMENUITEM {
+  int iPosition;
+  UAHMENUITEMMETRICS umim;
+  UAHMENUPOPUPMETRICS umpm;
+} UAHMENUITEM;
+
+typedef struct tagUAHDRAWMENUITEM {
+  DRAWITEMSTRUCT dis;
+  UAHMENU um;
+  UAHMENUITEM umi;
+} UAHDRAWMENUITEM;
+
+static LRESULT HandleMenuBarPaint(HWND hwnd, UINT msg, LPARAM lParam) {
+  if (msg == 0x0091) {
+    auto* udm = reinterpret_cast<UAHMENU*>(lParam);
+    MENUBARINFO mbi{};
+    mbi.cbSize = sizeof(mbi);
+    RECT rc{};
+    if (GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) {
+      RECT wr{};
+      GetWindowRect(hwnd, &wr);
+      rc = mbi.rcBar;
+      OffsetRect(&rc, -wr.left, -wr.top);
+    }
+    HBRUSH br = CreateSolidBrush(COL_BG);
+    FillRect(udm->hdc, &rc, br);
+    DeleteObject(br);
+    return 0;
+  }
+
+  auto* udmi = reinterpret_cast<UAHDRAWMENUITEM*>(lParam);
+  wchar_t text[128] = L"";
+  MENUITEMINFOW mii{};
+  mii.cbSize = sizeof(mii);
+  mii.fMask = MIIM_STRING;
+  mii.dwTypeData = text;
+  mii.cch = 127;
+  GetMenuItemInfoW(udmi->um.hmenu, (UINT)udmi->umi.iPosition, TRUE, &mii);
+
+  bool hot = (udmi->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) != 0;
+  HBRUSH br = CreateSolidBrush(hot ? RGB(24, 40, 62) : COL_BG);
+  FillRect(udmi->um.hdc, &udmi->dis.rcItem, br);
+  DeleteObject(br);
+
+  SetBkMode(udmi->um.hdc, TRANSPARENT);
+  SetTextColor(udmi->um.hdc, hot ? COL_PRIMARY : COL_TEXT);
+  SelectObject(udmi->um.hdc, hFontUi ? hFontUi : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+  RECT tr = udmi->dis.rcItem;
+  DrawTextW(udmi->um.hdc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   SetUnhandledExceptionFilter(ProxyPiUnhandledException);
   StartupLog(L"=== start ===");
   StartupLog((std::wstring(L"version ") + APP_VERSION).c_str());
+  EnableDarkAppMode();
 
   // DPI awareness (#24) — per-monitor v2 when available
 #if defined(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
@@ -3687,8 +4362,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
   // Resizable + maximizable; larger default client area
   const DWORD style = WS_OVERLAPPEDWINDOW;
-  RECT wr{ 0, 0, DEFAULT_CLIENT_W, DEFAULT_CLIENT_H };
-  AdjustWindowRectEx(&wr, style, TRUE, 0); // TRUE = account for menu bar
+  RECT wr{ 0, 0, DEFAULT_CLIENT_W, DEFAULT_CLIENT_H + MENU_STRIP_H };
+  AdjustWindowRectEx(&wr, style, FALSE, 0);
   int winW = wr.right - wr.left;
   int winH = wr.bottom - wr.top;
 
@@ -3704,7 +4379,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
   StartupLog(L"CreateWindowEx...");
   HWND hwnd = CreateWindowExW(
     WS_EX_CONTROLPARENT, L"ProxyPiTesterMain",
-    L"ProxyPiTester",
+    L"ProxyPi Tester",
     style,
     x, y, winW, winH,
     nullptr, nullptr, hInstance, nullptr);
@@ -3725,9 +4400,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     return 1;
   }
   StartupLog(L"window created OK");
-
-  SetMenu(hwnd, CreateAppMenu());
-  DrawMenuBar(hwnd);
+  ApplyDarkFrame(hwnd);
+  g_menuBar = CreateAppMenu();
 
   SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIconBig);
   SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSm);
