@@ -35,7 +35,7 @@
 
 // ---- App version & update feed (public GitHub — no credentials required) ----
 // Bump APP_VERSION when you ship a new build. Host update.json on a public repo/raw URL.
-static const wchar_t* APP_VERSION = L"1.3.4";
+static const wchar_t* APP_VERSION = L"1.3.5";
 static const wchar_t* APP_NAME = L"ProxyPiTester";
 // Primary: simple JSON on raw.githubusercontent.com
 // Fallback: GitHub Releases API for the same repo
@@ -3456,7 +3456,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       PaintAccentBar(mem, g_lay.cardX + 16, statusTop + 11, 4, 14, g_statusColor);
 
       {
-        std::wstring foot = L"No logging   ·   UK residential   ·   Pay as you go   ·   v";
+        std::wstring foot = L"No logging  \u00B7  UK residential  \u00B7  Pay as you go  \u00B7  v";
         foot += APP_VERSION;
         RECT footRc{ 8, g_lay.footerY - 2, client.right - 8, g_lay.footerY + 18 };
         SelectObject(mem, hFontSmall);

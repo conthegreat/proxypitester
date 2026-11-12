@@ -1,5 +1,5 @@
 {
-  "version": "1.3.4",
+  "version": "1.3.5",
   "download_url": "https://github.com/conthegreat/proxypitester/releases/latest",
-  "notes": "1.3.4: Refreshed layout, the real app icon, and clearer panels."
+  "notes": "1.3.5: The footer line uses clean separators."
 }
